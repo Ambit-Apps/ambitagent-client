@@ -1,0 +1,36 @@
+[Unit]
+Description=Ambit Agent runtime daemon
+Documentation=https://github.com/Ambit-Apps/ambitagent-client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ambit-agent
+Group=ambit-agent
+WorkingDirectory=/opt/ambit-agent
+ExecStart=/usr/bin/node /opt/ambit-agent/dist/main.js
+Restart=always
+RestartSec=5
+# Config file readable by the ambit-agent user only — it holds the
+# enrollment token in cleartext.
+EnvironmentFile=-/etc/ambit-agent/config
+# Stream stdout/stderr into journalctl.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ambit-agent
+
+# Hardening — the daemon has no reason to touch anything but its own
+# working directory and network. Playwright will need /tmp and Chrome's
+# cache paths later; add ReadWritePaths= for those when the runner lands.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/ambit-agent
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
