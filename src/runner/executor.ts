@@ -58,7 +58,11 @@ export function createEchoExecutor(log: Logger): Executor {
         ts: nowTs(),
         payload: {
           message: 'echo executor done',
-          outputs: { echoed_inputs: msg.inputs, script_length: msg.script.length },
+          outputs: {
+            echoed_inputs: msg.inputs,
+            file_count: msg.files.length,
+            file_paths: msg.files.map((f) => f.path),
+          },
         },
       });
     },

@@ -61,10 +61,20 @@ export interface RunTaskMessage {
   type: 'run_task';
   runId: string;
   taskDefinitionId: string;
-  script: string;
-  scriptSource: 'inline' | 'url';
+  /**
+   * Full file bundle of the task definition. One entry per file, with
+   * a bundle-relative path (e.g. "src/main.ts", "_lib/lib-common/src/csv.ts").
+   * Runtime reassembles into a working module graph, then executes
+   * "src/main.ts" as the entry point.
+   */
+  files: RunTaskFile[];
   inputs: unknown;
   credentialBundleId?: string;
+}
+
+export interface RunTaskFile {
+  path: string;
+  contents: string;
 }
 
 export interface CancelMessage {
