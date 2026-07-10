@@ -29,7 +29,10 @@ async function main(): Promise<void> {
   );
 
   const conn = createConnection(config, log);
-  const executor = createRealExecutor(log);
+  const executor = createRealExecutor(log, {
+    adminUrl: config.adminUrl,
+    enrollmentToken: config.enrollmentToken,
+  });
 
   conn.on('message', (msg: AdminToRuntime) => {
     switch (msg.type) {

@@ -41,9 +41,16 @@ export interface Executor {
   runTask(msg: RunTaskMessage, emit: (event: RunEventMessage) => void): Promise<void>;
 }
 
+export interface ExecutorConfig {
+  /** Base URL of the admin API — used for the ctx.ai.complete proxy. */
+  adminUrl: string;
+  /** Sent as `Authorization: Bearer <token>` on proxy calls. */
+  enrollmentToken: string;
+}
+
 const nowTs = () => Date.now();
 
-export function createRealExecutor(log: Logger): Executor {
+export function createRealExecutor(log: Logger, config: ExecutorConfig): Executor {
   return {
     async runTask(msg, emit) {
       log.info(
@@ -149,6 +156,7 @@ export function createRealExecutor(log: Logger): Executor {
           page: browser?.page,
           emit,
           log,
+          config,
         });
 
         const result = await (mod.run as (i: unknown, c: unknown) => Promise<unknown>)(
@@ -199,6 +207,7 @@ function createRuntimeCtx({
   page,
   emit,
   log,
+  config,
 }: {
   runId: string;
   inputs: unknown;
@@ -206,6 +215,7 @@ function createRuntimeCtx({
   page: Page | undefined;
   emit: (event: RunEventMessage) => void;
   log: Logger;
+  config: ExecutorConfig;
 }) {
   const uploadArtifact = (buf: Uint8Array, name: string, mimeType: string, label?: string) => {
     const b64 = Buffer.from(buf).toString('base64');
@@ -275,13 +285,55 @@ function createRuntimeCtx({
     },
 
     ai: {
-      async complete(): Promise<string> {
-        // TODO: proxy Bedrock via admin. Runtime doesn't hold AWS
-        // credentials — same reason worker-side ctx.ai proxies too.
-        throw new Error(
-          'ctx.ai.complete: not yet available in the runtime (Bedrock proxy pending). ' +
-            'For now, ai.complete only works in API-type agents that execute in-admin.',
-        );
+      /**
+       * Runtimes never hold AWS credentials. We POST to the admin's
+       * `/rest/ai/proxy` endpoint (authed with our enrollment token)
+       * and it forwards to Bedrock. The admin also accounts tokens
+       * against the task_run and emits a `ctx.ai.complete` log event,
+       * so nothing to do on this side beyond returning the text.
+       */
+      async complete(opts: {
+        system?: string;
+        messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+        maxTokens?: number;
+        temperature?: number;
+        model?: string;
+      }): Promise<string> {
+        if (!opts || !Array.isArray(opts.messages) || opts.messages.length === 0) {
+          throw new Error('ctx.ai.complete: opts.messages is required and non-empty');
+        }
+        const url = `${config.adminUrl.replace(/\/$/, '')}/rest/ai/proxy`;
+        let res: Response;
+        try {
+          res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${config.enrollmentToken}`,
+            },
+            body: JSON.stringify({
+              runId,
+              system:      opts.system,
+              messages:    opts.messages,
+              maxTokens:   opts.maxTokens,
+              temperature: opts.temperature,
+              model:       opts.model,
+            }),
+          });
+        } catch (err) {
+          throw new Error(`ctx.ai.complete: request to ${url} failed: ${(err as Error).message}`);
+        }
+        if (!res.ok) {
+          const bodyText = await res.text().catch(() => '');
+          throw new Error(
+            `ctx.ai.complete: admin returned ${res.status}: ${bodyText || res.statusText}`,
+          );
+        }
+        const payload = (await res.json()) as { text?: string };
+        if (typeof payload.text !== 'string') {
+          throw new Error('ctx.ai.complete: admin response missing text');
+        }
+        return payload.text;
       },
     },
 
