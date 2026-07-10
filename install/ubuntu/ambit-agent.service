@@ -8,21 +8,34 @@ Wants=network-online.target
 Type=simple
 User=ambit-agent
 Group=ambit-agent
-WorkingDirectory=/opt/ambit-agent
-ExecStart=/usr/bin/node /opt/ambit-agent/dist/main.js
+WorkingDirectory=/opt/ambit-agent/app
+
+# HOME points at the install root so anything Node / npm resolves via
+# $HOME lands inside our sandbox — ProtectHome=true below blocks /home.
+Environment=HOME=/opt/ambit-agent
+Environment=NODE_ENV=production
+
+# Config file (written by install.sh) supplies ADMIN_URL, ENROLLMENT_TOKEN,
+# HEADLESS, PLAYWRIGHT_BROWSERS_PATH, LOG_LEVEL. The leading '-' makes
+# the load non-fatal on first boot — the daemon dies loudly on missing
+# required vars, which is easier to diagnose than a silent systemd
+# failure.
+EnvironmentFile=-/etc/ambit-agent/config
+
+ExecStart=/usr/bin/node /opt/ambit-agent/app/dist/main.js
+
 Restart=always
 RestartSec=5
-# Config file readable by the ambit-agent user only — it holds the
-# enrollment token in cleartext.
-EnvironmentFile=-/etc/ambit-agent/config
-# Stream stdout/stderr into journalctl.
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ambit-agent
 
-# Hardening — the daemon has no reason to touch anything but its own
-# working directory and network. Playwright will need /tmp and Chrome's
-# cache paths later; add ReadWritePaths= for those when the runner lands.
+# ─── sandboxing ──────────────────────────────────────────────────────
+# The daemon has no reason to touch anything but its own install root
+# and network. Playwright's browser cache + Node's npm cache live under
+# HOME which we've pointed at /opt/ambit-agent, so ReadWritePaths on
+# that single directory covers both.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -30,7 +43,13 @@ PrivateTmp=true
 ReadWritePaths=/opt/ambit-agent
 ProtectKernelModules=true
 ProtectKernelTunables=true
+ProtectControlGroups=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# MemoryDenyWriteExecute would break V8's JIT — Chromium won't start
+# with it on, so we leave it off. The rest of the sandbox is still
+# meaningful defense-in-depth.
 
 [Install]
 WantedBy=multi-user.target
