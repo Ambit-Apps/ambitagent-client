@@ -84,26 +84,37 @@ if (-not $AdminUrl -or -not $EnrollmentToken) {
     Write-Fail 'ADMIN_URL and ENROLLMENT_TOKEN are both required.'
 }
 
-# --- prereqs via winget ----------------------------------------------
+# --- prereqs ---------------------------------------------------------
+# Preference: winget on Windows 10/11 clients where it's available.
+# Fallback: on Windows Server (no App Installer) we require the three
+# tools to be pre-installed manually; we only fail if a prereq is
+# missing AND winget isn't there to install it. This lets the same
+# script drive both client and server installs.
 function Refresh-Path {
     $env:Path =
         [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
         [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Fail 'winget is required but not found. Install "App Installer" from the Microsoft Store, or use Windows 10 21H2+ / Windows 11.'
-}
+$HasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
 
 function Ensure-Package {
     param(
         [string]$Id,
         [string]$Name,
-        [scriptblock]$AlreadyThere
+        [scriptblock]$AlreadyThere,
+        [string]$ManualUrl
     )
     if (& $AlreadyThere) {
         Write-Info "$Name already installed -- reusing."
         return
+    }
+    if (-not $HasWinget) {
+        Write-Fail (
+            "$Name is not installed and winget is unavailable on this system " +
+            "(common on Windows Server). Install $Name manually from $ManualUrl " +
+            "and re-run this script."
+        )
     }
     Write-Info "Installing $Name via winget..."
     & winget install --id $Id -e --silent --accept-source-agreements --accept-package-agreements
@@ -113,20 +124,26 @@ function Ensure-Package {
     Refresh-Path
 }
 
-Ensure-Package -Id 'OpenJS.NodeJS.LTS' -Name 'Node.js LTS' -AlreadyThere {
-    $node = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $node) { return $false }
-    $ver = & node -v
-    return ($ver -match '^v(\d+)') -and ([int]$Matches[1] -ge 20)
-}
+Ensure-Package -Id 'OpenJS.NodeJS.LTS' -Name 'Node.js LTS' `
+    -ManualUrl 'https://nodejs.org/en/download/ (pick LTS x64 .msi)' `
+    -AlreadyThere {
+        $node = Get-Command node -ErrorAction SilentlyContinue
+        if (-not $node) { return $false }
+        $ver = & node -v
+        return ($ver -match '^v(\d+)') -and ([int]$Matches[1] -ge 20)
+    }
 
-Ensure-Package -Id 'Git.Git' -Name 'Git' -AlreadyThere {
-    [bool](Get-Command git -ErrorAction SilentlyContinue)
-}
+Ensure-Package -Id 'Git.Git' -Name 'Git' `
+    -ManualUrl 'https://git-scm.com/download/win' `
+    -AlreadyThere {
+        [bool](Get-Command git -ErrorAction SilentlyContinue)
+    }
 
-Ensure-Package -Id 'NSSM.NSSM' -Name 'NSSM' -AlreadyThere {
-    [bool](Get-Command nssm -ErrorAction SilentlyContinue)
-}
+Ensure-Package -Id 'NSSM.NSSM' -Name 'NSSM' `
+    -ManualUrl 'https://nssm.cc/release/nssm-2.24.zip (extract nssm.exe to a folder on PATH)' `
+    -AlreadyThere {
+        [bool](Get-Command nssm -ErrorAction SilentlyContinue)
+    }
 
 # --- dirs ------------------------------------------------------------
 Write-Info "Preparing directories under $InstallRoot and $DataDir..."
