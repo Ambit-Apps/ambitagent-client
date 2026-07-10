@@ -258,15 +258,27 @@ if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
 }
 
 Write-Info "Registering service $ServiceName (NSSM)..."
-# NSSM stores AppParameters verbatim and concatenates it after the exe
-# path when constructing the child's command line. If we pass the .js
-# path unquoted here, the space in "Program Files" (and "Ambit Agent")
-# gets treated by Node's argv parser as an argument separator, and
-# Node ends up trying to require('C:\Program') on service start.
-# Embed literal double quotes around the script path so NSSM stores
-# them and passes a properly-quoted command line to CreateProcess.
 & nssm install $ServiceName $nodeExe                                         | Out-Null
-& nssm set $ServiceName AppParameters "`"$mainJs`""                          | Out-Null
+
+# NSSM concatenates AppParameters after the exe path when building the
+# child's command line. If the script path contains a space (which it
+# does -- "C:\Program Files\Ambit Agent\..."), Node's argv parser
+# splits on the unescaped space and fails with
+# `Cannot find module 'C:\Program'`.
+#
+# The fix is to store AppParameters WITH embedded quotes. But nssm's
+# CLI (`nssm set ... AppParameters "..."`) strips one layer of quotes
+# during Windows argv parsing before nssm ever sees them -- so the
+# quotes never make it into the registry. NSSM's own docs recommend
+# their GUI (`nssm edit`) for programs needing quoted args, which
+# isn't scriptable.
+#
+# Reliable workaround: write directly to the registry key where nssm
+# stores AppParameters. Set-ItemProperty preserves the value byte-for-
+# byte, quotes intact. nssm reads it back correctly at start time.
+$paramsKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
+Set-ItemProperty -Path $paramsKey -Name 'AppParameters' -Value "`"$mainJs`""
+
 & nssm set $ServiceName AppDirectory $AppDir                                 | Out-Null
 & nssm set $ServiceName DisplayName 'Ambit Agent Runtime'                    | Out-Null
 & nssm set $ServiceName Description 'Ambit Agent -- local runtime daemon for browser-type automation tasks.' | Out-Null
