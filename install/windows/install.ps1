@@ -258,7 +258,15 @@ if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
 }
 
 Write-Info "Registering service $ServiceName (NSSM)..."
-& nssm install $ServiceName $nodeExe $mainJs                                 | Out-Null
+# NSSM stores AppParameters verbatim and concatenates it after the exe
+# path when constructing the child's command line. If we pass the .js
+# path unquoted here, the space in "Program Files" (and "Ambit Agent")
+# gets treated by Node's argv parser as an argument separator, and
+# Node ends up trying to require('C:\Program') on service start.
+# Embed literal double quotes around the script path so NSSM stores
+# them and passes a properly-quoted command line to CreateProcess.
+& nssm install $ServiceName $nodeExe                                         | Out-Null
+& nssm set $ServiceName AppParameters "`"$mainJs`""                          | Out-Null
 & nssm set $ServiceName AppDirectory $AppDir                                 | Out-Null
 & nssm set $ServiceName DisplayName 'Ambit Agent Runtime'                    | Out-Null
 & nssm set $ServiceName Description 'Ambit Agent -- local runtime daemon for browser-type automation tasks.' | Out-Null
