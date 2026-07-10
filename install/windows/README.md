@@ -25,6 +25,10 @@ From an **elevated** PowerShell prompt (right-click PowerShell ⇢ Run as
 Administrator):
 
 ```powershell
+# Force TLS 1.2 — Windows PowerShell 5.1 defaults to TLS 1.0/1.1 which
+# GitHub refuses. Not needed on PowerShell 7+.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $env:AMBIT_ADMIN_URL='https://ambitagent-prod.example.com'
 $env:AMBIT_ENROLLMENT_TOKEN='<token-from-portal>'
 iwr https://raw.githubusercontent.com/Ambit-Apps/ambitagent-client/main/install/windows/install.ps1 -UseBasicParsing | iex
@@ -33,6 +37,7 @@ iwr https://raw.githubusercontent.com/Ambit-Apps/ambitagent-client/main/install/
 Prefer to inspect first:
 
 ```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 iwr https://raw.githubusercontent.com/Ambit-Apps/ambitagent-client/main/install/windows/install.ps1 `
   -UseBasicParsing -OutFile install.ps1
 notepad install.ps1
@@ -107,11 +112,23 @@ Check `C:\ProgramData\Ambit Agent\logs\stderr.log`:
 - `4401 Unauthorized` ⇢ enrollment token was already used on a
   different machine. Enroll a fresh runtime in the portal.
 
+**`iwr` fails with "Could not create SSL/TLS secure channel".**
+
+Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub refuses.
+Run this line first, then retry the install command:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+```
+
 **`winget` not found.**
 
 Windows 10 versions older than 21H2 don't ship App Installer. Install
 it from the Microsoft Store, or upgrade to Win 11. On Windows Server
-2022, install "App Installer" via `Add-AppxPackage`.
+2022, install "App Installer" via `Add-AppxPackage`, OR install Node,
+Git, and NSSM manually first — this installer detects existing
+binaries via `Get-Command` and skips winget for anything already on
+PATH.
 
 **Chromium fails to launch — `Executable doesn't exist at ...`.**
 

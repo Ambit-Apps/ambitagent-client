@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 #
-# Ambit Agent runtime — Windows installer.
+# Ambit Agent runtime -- Windows installer.
 #
 # What it does, in order:
 #   1.  Elevation is enforced by the #Requires directive above.
@@ -15,7 +15,7 @@
 #   9.  Registers an NSSM-wrapped service `ambit-agent`, sets restart
 #       policy + log rotation, and starts it.
 #
-# Usage — one-liner from an elevated PowerShell prompt:
+# Usage -- one-liner from an elevated PowerShell prompt:
 #
 #   $env:AMBIT_ADMIN_URL='https://ambitagent-prod.example.com'
 #   $env:AMBIT_ENROLLMENT_TOKEN='<token-from-portal>'
@@ -27,7 +27,7 @@
 #   Get-Content install.ps1 | more   # review before running
 #   .\install.ps1
 #
-# Re-running is safe — the script is idempotent (winget skips already-
+# Re-running is safe -- the script is idempotent (winget skips already-
 # installed packages, git fetch+reset updates the checkout in place,
 # and the service is torn down + reinstalled cleanly).
 #
@@ -58,7 +58,7 @@ function Write-Info { param($m) Write-Host "[install] $m" -ForegroundColor Cyan 
 function Write-Warn { param($m) Write-Host "[install] $m" -ForegroundColor Yellow }
 function Write-Fail { param($m) Write-Host "[install] $m" -ForegroundColor Red; exit 1 }
 
-# ─── config source ───────────────────────────────────────────────────
+# --- config source ---------------------------------------------------
 $AdminUrl        = if ($env:AMBIT_ADMIN_URL)        { $env:AMBIT_ADMIN_URL }        else { '' }
 $EnrollmentToken = if ($env:AMBIT_ENROLLMENT_TOKEN) { $env:AMBIT_ENROLLMENT_TOKEN } else { '' }
 $ClientGitUrl    = if ($env:AMBIT_CLIENT_GIT_URL)   { $env:AMBIT_CLIENT_GIT_URL }   else { $DefaultGitUrl }
@@ -84,7 +84,7 @@ if (-not $AdminUrl -or -not $EnrollmentToken) {
     Write-Fail 'ADMIN_URL and ENROLLMENT_TOKEN are both required.'
 }
 
-# ─── prereqs via winget ──────────────────────────────────────────────
+# --- prereqs via winget ----------------------------------------------
 function Refresh-Path {
     $env:Path =
         [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
@@ -102,10 +102,10 @@ function Ensure-Package {
         [scriptblock]$AlreadyThere
     )
     if (& $AlreadyThere) {
-        Write-Info "$Name already installed — reusing."
+        Write-Info "$Name already installed -- reusing."
         return
     }
-    Write-Info "Installing $Name via winget…"
+    Write-Info "Installing $Name via winget..."
     & winget install --id $Id -e --silent --accept-source-agreements --accept-package-agreements
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "winget install $Id failed (exit $LASTEXITCODE)."
@@ -128,15 +128,15 @@ Ensure-Package -Id 'NSSM.NSSM' -Name 'NSSM' -AlreadyThere {
     [bool](Get-Command nssm -ErrorAction SilentlyContinue)
 }
 
-# ─── dirs ────────────────────────────────────────────────────────────
-Write-Info "Preparing directories under $InstallRoot and $DataDir…"
+# --- dirs ------------------------------------------------------------
+Write-Info "Preparing directories under $InstallRoot and $DataDir..."
 foreach ($d in @($InstallRoot, $BrowsersDir, $DataDir, $LogsDir)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
-# ─── daemon source ───────────────────────────────────────────────────
+# --- daemon source ---------------------------------------------------
 if (Test-Path (Join-Path $AppDir '.git')) {
-    Write-Info "Updating existing checkout at $AppDir (ref=$ClientRef)…"
+    Write-Info "Updating existing checkout at $AppDir (ref=$ClientRef)..."
     Push-Location $AppDir
     try {
         & git fetch --depth 1 origin $ClientRef
@@ -147,24 +147,24 @@ if (Test-Path (Join-Path $AppDir '.git')) {
         Pop-Location
     }
 } else {
-    Write-Info "Cloning $ClientGitUrl @ $ClientRef into $AppDir…"
+    Write-Info "Cloning $ClientGitUrl @ $ClientRef into $AppDir..."
     if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
     & git clone --depth 1 --branch $ClientRef $ClientGitUrl $AppDir
     if ($LASTEXITCODE -ne 0) { Write-Fail 'git clone failed.' }
 }
 
-# ─── build ───────────────────────────────────────────────────────────
+# --- build -----------------------------------------------------------
 Push-Location $AppDir
 try {
-    Write-Info "Installing daemon npm dependencies (npm ci)…"
+    Write-Info "Installing daemon npm dependencies (npm ci)..."
     & npm ci
     if ($LASTEXITCODE -ne 0) { Write-Fail 'npm ci failed.' }
 
-    Write-Info "Building daemon (tsc)…"
+    Write-Info "Building daemon (tsc)..."
     & npm run build
     if ($LASTEXITCODE -ne 0) { Write-Fail 'npm run build failed.' }
 
-    Write-Info "Downloading Playwright Chromium into $BrowsersDir…"
+    Write-Info "Downloading Playwright Chromium into $BrowsersDir..."
     # PLAYWRIGHT_BROWSERS_PATH controls where the browser is downloaded;
     # sits under Program Files so ordinary users can't tamper with it
     # and Windows Defender treats it as system-owned.
@@ -175,15 +175,15 @@ try {
     Pop-Location
 }
 
-# ─── config file ─────────────────────────────────────────────────────
-Write-Info "Writing config to $ConfigFile…"
+# --- config file -----------------------------------------------------
+Write-Info "Writing config to $ConfigFile..."
 
 # Same shell-style KEY=VALUE the Ubuntu installer produces. The daemon's
 # config loader (src/config.ts) reads either file based on process.platform.
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $configContent = @"
 # Ambit Agent runtime config. Written by install.ps1 at $stamp.
-# The daemon reads this at startup — see readSystemConfig() in src/config.ts.
+# The daemon reads this at startup -- see readSystemConfig() in src/config.ts.
 
 ADMIN_URL=$AdminUrl
 ENROLLMENT_TOKEN=$EnrollmentToken
@@ -200,9 +200,9 @@ PLAYWRIGHT_BROWSERS_PATH=$BrowsersDir
 LOG_LEVEL=$LogLevel
 "@
 
-# Write UTF-8 without BOM — PS 5.1's Set-Content -Encoding utf8 emits
+# Write UTF-8 without BOM -- PS 5.1's Set-Content -Encoding utf8 emits
 # a BOM, and while the daemon's parser tolerates it (String.trim strips
-# ﻿), avoiding it upfront is cleaner and matches Linux tooling.
+# ), avoiding it upfront is cleaner and matches Linux tooling.
 [System.IO.File]::WriteAllText(
     $ConfigFile,
     $configContent,
@@ -223,7 +223,7 @@ $acl.AddAccessRule($sysRule)
 $acl.AddAccessRule($adminRule)
 Set-Acl -Path $ConfigFile -AclObject $acl
 
-# ─── NSSM service ────────────────────────────────────────────────────
+# --- NSSM service ----------------------------------------------------
 $nodeExe = (Get-Command node).Source
 $mainJs  = Join-Path $AppDir 'dist\main.js'
 if (-not (Test-Path $mainJs)) {
@@ -233,25 +233,25 @@ if (-not (Test-Path $mainJs)) {
 # Idempotence: teardown any existing service registration first, so we
 # don't accumulate config drift across reinstalls.
 if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
-    Write-Info "Stopping existing service $ServiceName…"
+    Write-Info "Stopping existing service $ServiceName..."
     & nssm stop $ServiceName confirm | Out-Null
     Start-Sleep -Seconds 2
-    Write-Info "Removing existing service registration…"
+    Write-Info "Removing existing service registration..."
     & nssm remove $ServiceName confirm | Out-Null
 }
 
-Write-Info "Registering service $ServiceName (NSSM)…"
+Write-Info "Registering service $ServiceName (NSSM)..."
 & nssm install $ServiceName $nodeExe $mainJs                                 | Out-Null
 & nssm set $ServiceName AppDirectory $AppDir                                 | Out-Null
 & nssm set $ServiceName DisplayName 'Ambit Agent Runtime'                    | Out-Null
-& nssm set $ServiceName Description 'Ambit Agent — local runtime daemon for browser-type automation tasks.' | Out-Null
+& nssm set $ServiceName Description 'Ambit Agent -- local runtime daemon for browser-type automation tasks.' | Out-Null
 & nssm set $ServiceName Start SERVICE_AUTO_START                             | Out-Null
 
-# Restart policy — matches systemd's Restart=always, RestartSec=5.
+# Restart policy -- matches systemd's Restart=always, RestartSec=5.
 & nssm set $ServiceName AppExit Default Restart                              | Out-Null
 & nssm set $ServiceName AppRestartDelay 5000                                 | Out-Null
 
-# Log rotation — NSSM writes stdout/stderr to files it rotates when
+# Log rotation -- NSSM writes stdout/stderr to files it rotates when
 # they exceed AppRotateBytes. Rotated files get .N suffixes in $LogsDir.
 $stdoutLog = Join-Path $LogsDir 'stdout.log'
 $stderrLog = Join-Path $LogsDir 'stderr.log'
@@ -262,14 +262,14 @@ $stderrLog = Join-Path $LogsDir 'stderr.log'
 & nssm set $ServiceName AppStdoutCreationDisposition 4                       | Out-Null   # OPEN_ALWAYS
 & nssm set $ServiceName AppStderrCreationDisposition 4                       | Out-Null
 
-# Service account — LocalSystem for MVP simplicity. Windows equivalent
+# Service account -- LocalSystem for MVP simplicity. Windows equivalent
 # to systemd's User=ambit-agent would be an "NT SERVICE\ambit-agent"
 # virtual account, but wiring that requires SeServiceLogonRight grants
 # and per-directory ACL updates. LocalSystem is more permissive than
 # ideal; hardening to a virtual account is a Phase 2 item.
 & nssm set $ServiceName ObjectName LocalSystem                               | Out-Null
 
-Write-Info "Starting service $ServiceName…"
+Write-Info "Starting service $ServiceName..."
 Start-Service $ServiceName
 Start-Sleep -Seconds 2
 
@@ -288,5 +288,5 @@ Write-Host "  Reconfigure svc:  nssm edit $ServiceName"
 Write-Host ""
 Write-Host "Portal > Staff > Runtimes should show this runtime as **online**"
 Write-Host "within about 15 seconds (the heartbeat interval). If it stays"
-Write-Host "offline, check '$stderrLog' — the most common causes are a"
+Write-Host "offline, check '$stderrLog' -- the most common causes are a"
 Write-Host "wrong ADMIN_URL or a token already used on another machine."
