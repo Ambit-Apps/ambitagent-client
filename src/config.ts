@@ -1,18 +1,24 @@
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * Runtime daemon config. Two sources, in priority order:
  *
  * 1. Environment variables (dev machines, systemd `Environment=` lines).
- * 2. `/etc/ambit-agent/config` (a shell-style KEY=VALUE file the
- *    installer drops on Ubuntu VMs). Env vars still override.
+ * 2. The system config file — a shell-style KEY=VALUE file the installer
+ *    drops on customer machines. Env vars still override.
+ *      - Linux:   /etc/ambit-agent/config
+ *      - Windows: %ProgramData%\Ambit Agent\config
  *
  * Both `ADMIN_URL` and `ENROLLMENT_TOKEN` are required; startup fails
  * loudly if either is missing.
  */
 
-const SYSTEM_CONFIG_PATH = '/etc/ambit-agent/config';
+const SYSTEM_CONFIG_PATH =
+  process.platform === 'win32'
+    ? join(process.env.ProgramData ?? 'C:\\ProgramData', 'Ambit Agent', 'config')
+    : '/etc/ambit-agent/config';
 
 export interface Config {
   adminUrl: string;        // e.g. http://localhost:3100 (dev) or https://api.ambitagent.com (prod)
