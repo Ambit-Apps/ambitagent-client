@@ -1,24 +1,41 @@
+import { register } from 'tsx/esm/api';
+import { mkdtemp, mkdir, writeFile, symlink, rm, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import type { Page } from 'playwright';
+
 import type {
   RunTaskMessage,
   RunEventMessage,
 } from '../protocol/ws.js';
 import type { Logger } from '../log.js';
+import { launchBrowser } from './browser.js';
 
 /**
- * Phase 0 stub executor.
+ * Real executor — mirrors `apps/api/src/worker.ts` on the admin side,
+ * with Playwright injected for browser-type runs.
  *
- * Ignores the actual script body and just emits:
- *   started -> log("hello from echo agent") -> completed
- *
- * When Playwright wiring lands (with the task-runs work on the admin
- * side already complete), this file gets replaced with a real
- * evaluator that:
- *   - loads the script body into a sandboxed module
- *   - hands it a `ctx` object (Playwright page, ctx.reportProgress,
- *     ctx.uploadScreenshot, ctx.ai.complete)
- *   - awaits its result
- *   - emits per-step events during execution
+ * The pipeline per run_task:
+ *   1. Reassemble the file bundle into a temp dir (fresh per run so
+ *      concurrent runs don't collide).
+ *   2. Drop a `type: module` package.json at the root — without it,
+ *      newer Node (22.12+) treats main.ts as CJS via tsx's loader and
+ *      throws ERR_REQUIRE_CYCLE_MODULE on ESM imports. Same fix we
+ *      landed on the API worker side.
+ *   3. For each bundled @ambit/* library under `_lib/`, generate a
+ *      minimal package.json and symlink it into node_modules/@ambit/
+ *      so imports resolve.
+ *   4. Launch Playwright (browser-type only). tsx register() hooks
+ *      the .ts loader before we dynamic-import main.ts.
+ *   5. Build a `ctx` mirroring dev-runner's local ctx but with sinks
+ *      wired to WebSocket events instead of console.log.
+ *   6. Await mod.run(inputs, ctx). Emit `completed` with outputs on
+ *      success, `error` on throw. Always clean up in `finally`.
  */
+
+// tsx must be registered before any dynamic .ts import.
+register();
 
 export interface Executor {
   runTask(msg: RunTaskMessage, emit: (event: RunEventMessage) => void): Promise<void>;
@@ -26,49 +43,300 @@ export interface Executor {
 
 const nowTs = () => Date.now();
 
-export function createEchoExecutor(log: Logger): Executor {
+export function createRealExecutor(log: Logger): Executor {
   return {
     async runTask(msg, emit) {
-      log.info({ runId: msg.runId, taskDefinitionId: msg.taskDefinitionId }, 'echo executor: run');
+      log.info(
+        { runId: msg.runId, taskDefinitionId: msg.taskDefinitionId, fileCount: msg.files.length },
+        'executor: picked up run',
+      );
 
       emit({
         type: 'run_event',
         runId: msg.runId,
         kind: 'started',
         ts: nowTs(),
-        payload: { message: 'echo executor starting' },
+        payload: { message: 'runtime picked up run' },
       });
 
-      await sleep(200);
+      // Figure out shape upfront — a bundle without src/main.ts can't
+      // be executed. Fail fast so we don't spin up a browser for
+      // nothing.
+      const hasMain = msg.files.some((f) => f.path === 'src/main.ts');
+      if (!hasMain) {
+        emit({
+          type: 'run_event',
+          runId: msg.runId,
+          kind: 'error',
+          ts: nowTs(),
+          payload: { message: 'bundle is missing src/main.ts' },
+        });
+        return;
+      }
 
-      emit({
-        type: 'run_event',
-        runId: msg.runId,
-        kind: 'log',
-        ts: nowTs(),
-        payload: { message: 'hello from echo agent', inputs: msg.inputs },
-      });
+      const tmpRoot = await mkdtemp(join(tmpdir(), `ambit-run-${msg.runId}-`));
+      let browser: Awaited<ReturnType<typeof launchBrowser>> | null = null;
+      const isBrowserType = await bundleUsesPlaywright(msg);
 
-      await sleep(200);
+      try {
+        // 1) Write every file.
+        for (const f of msg.files) {
+          const dst = join(tmpRoot, f.path);
+          await mkdir(dirname(dst), { recursive: true });
+          await writeFile(dst, f.contents);
+        }
 
-      emit({
-        type: 'run_event',
-        runId: msg.runId,
-        kind: 'completed',
-        ts: nowTs(),
-        payload: {
-          message: 'echo executor done',
-          outputs: {
-            echoed_inputs: msg.inputs,
-            file_count: msg.files.length,
-            file_paths: msg.files.map((f) => f.path),
-          },
-        },
-      });
+        // 2) Bundle-root ESM marker.
+        await writeFile(
+          join(tmpRoot, 'package.json'),
+          JSON.stringify({ name: `ambit-run-${msg.runId}`, version: '0.0.0', type: 'module' }, null, 2),
+        );
+
+        // 3) Symlink bundled @ambit/* libs into node_modules.
+        const libRoot = join(tmpRoot, '_lib');
+        const libs = await tryReadSubdirs(libRoot);
+        if (libs.length > 0) {
+          const nodeModulesAmbit = join(tmpRoot, 'node_modules', '@ambit');
+          await mkdir(nodeModulesAmbit, { recursive: true });
+          for (const pkg of libs) {
+            const pkgDir = join(libRoot, pkg);
+            await writeFile(
+              join(pkgDir, 'package.json'),
+              JSON.stringify(
+                {
+                  name: `@ambit/${pkg}`,
+                  version: '0.0.0',
+                  type: 'module',
+                  main: './src/index.ts',
+                  types: './src/index.ts',
+                  exports: {
+                    '.': { types: './src/index.ts', default: './src/index.ts' },
+                  },
+                },
+                null,
+                2,
+              ),
+            );
+            await symlink(pkgDir, join(nodeModulesAmbit, pkg), 'dir');
+          }
+        }
+
+        // 4) Browser? Launch it before importing the script — browser
+        // scripts expect `ctx.page` to exist the moment they run.
+        //
+        // Default is head-full: customers on RDP-into-a-Ubuntu-VM or
+        // laptop installs value seeing the browser do its thing —
+        // it's the visible proof-of-work. Set HEADLESS=true on truly
+        // headless server installs (no X server / no framebuffer).
+        if (isBrowserType) {
+          const headless = process.env.HEADLESS === 'true';
+          browser = await launchBrowser({ headless });
+        }
+
+        // 5) Dynamic-import the entry.
+        const mainPath = join(tmpRoot, 'src', 'main.ts');
+        const mainUrl = pathToFileURL(mainPath).href;
+        const mod = (await import(mainUrl)) as { run?: unknown };
+        if (typeof mod.run !== 'function') {
+          throw new Error('main.ts does not export a run() function');
+        }
+
+        // 6) Build ctx + execute.
+        const ctx = createRuntimeCtx({
+          runId: msg.runId,
+          inputs: msg.inputs,
+          credentials: msg.credentials ?? {},
+          page: browser?.page,
+          emit,
+          log,
+        });
+
+        const result = await (mod.run as (i: unknown, c: unknown) => Promise<unknown>)(
+          msg.inputs ?? {},
+          ctx,
+        );
+
+        emit({
+          type: 'run_event',
+          runId: msg.runId,
+          kind: 'completed',
+          ts: nowTs(),
+          payload: { message: 'run completed', outputs: result },
+        });
+      } catch (err) {
+        const e = err as Error;
+        log.error({ runId: msg.runId, err: e.message, stack: e.stack }, 'run failed');
+        emit({
+          type: 'run_event',
+          runId: msg.runId,
+          kind: 'error',
+          ts: nowTs(),
+          payload: { message: e.message, stack: e.stack },
+        });
+      } finally {
+        if (browser) {
+          try { await browser.close(); } catch { /* ignore */ }
+        }
+        try {
+          await rm(tmpRoot, { recursive: true, force: true });
+        } catch {
+          // Cleanup failure is not worth failing the run over.
+        }
+      }
     },
   };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * `ctx` handed to the script. Same shape as dev-runner's local ctx
+ * — the whole point of the parity is that the same code works on
+ * either side.
+ */
+function createRuntimeCtx({
+  runId,
+  inputs,
+  credentials,
+  page,
+  emit,
+  log,
+}: {
+  runId: string;
+  inputs: unknown;
+  credentials: Record<string, Record<string, string>>;
+  page: Page | undefined;
+  emit: (event: RunEventMessage) => void;
+  log: Logger;
+}) {
+  const uploadArtifact = (buf: Uint8Array, name: string, mimeType: string, label?: string) => {
+    const b64 = Buffer.from(buf).toString('base64');
+    emit({
+      type: 'run_event',
+      runId,
+      kind: 'artifact',
+      ts: nowTs(),
+      payload: {
+        name,
+        mime_type: mimeType,
+        size_bytes: buf.byteLength,
+        contents_b64: b64,
+        label,
+      },
+    });
+    // The URL is minted server-side after insert; the runtime doesn't
+    // know the artifact id. We return an opaque marker so the script
+    // has *something* to log or return. The customer's run-detail page
+    // is where the real download link appears.
+    return `artifact:${name}`;
+  };
+
+  return {
+    inputs: inputs ?? {},
+    dryRun: false,
+
+    credentials(id: string) {
+      const bundle = credentials[id];
+      if (!bundle) {
+        emit({
+          type: 'run_event',
+          runId,
+          kind: 'log',
+          ts: nowTs(),
+          payload: {
+            message: `ctx.credentials("${id}"): not attached to this agent (returning empty bundle)`,
+          },
+        });
+        return {};
+      }
+      return { ...bundle };
+    },
+
+    progress(msg: string) {
+      emit({
+        type: 'run_event',
+        runId,
+        kind: 'progress',
+        ts: nowTs(),
+        payload: { message: msg },
+      });
+    },
+
+    log(msg: string, payload?: unknown) {
+      const p =
+        payload !== undefined && payload !== null && typeof payload === 'object'
+          ? { message: msg, ...(payload as Record<string, unknown>) }
+          : { message: msg, ...(payload !== undefined ? { value: payload } : {}) };
+      emit({
+        type: 'run_event',
+        runId,
+        kind: 'log',
+        ts: nowTs(),
+        payload: p,
+      });
+    },
+
+    ai: {
+      async complete(): Promise<string> {
+        // TODO: proxy Bedrock via admin. Runtime doesn't hold AWS
+        // credentials — same reason worker-side ctx.ai proxies too.
+        throw new Error(
+          'ctx.ai.complete: not yet available in the runtime (Bedrock proxy pending). ' +
+            'For now, ai.complete only works in API-type agents that execute in-admin.',
+        );
+      },
+    },
+
+    async uploadFile(buf: Uint8Array, name: string, mimeType?: string): Promise<string> {
+      const mime = mimeType ?? guessMime(name);
+      return uploadArtifact(buf, name.slice(0, 255) || 'artifact.bin', mime.slice(0, 128));
+    },
+
+    // Browser-only surface. Undefined on api-type ctx.
+    page,
+    uploadScreenshot: page
+      ? async (buf: Uint8Array, label: string): Promise<string> => {
+          const safeLabel = String(label ?? 'screenshot').replace(/[^a-z0-9_-]+/gi, '-');
+          return uploadArtifact(buf, `${safeLabel}.png`, 'image/png', safeLabel);
+        }
+      : undefined,
+  };
+}
+
+async function tryReadSubdirs(dir: string): Promise<string[]> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Peek at the entry file for a `ctx.page` reference. Not perfect (a
+ * script that renames `ctx` or reads page via bracket-notation slips
+ * through), but good enough as a heuristic to avoid launching Chrome
+ * for pure API-type scripts. Falls back to "browser" if unsure.
+ *
+ * Longer-term we should send `runtime_type` in the run_task message
+ * so the runtime doesn't have to guess.
+ */
+async function bundleUsesPlaywright(msg: RunTaskMessage): Promise<boolean> {
+  const main = msg.files.find((f) => f.path === 'src/main.ts');
+  if (!main) return false;
+  return /ctx\.page|ctx\.uploadScreenshot/.test(main.contents);
+}
+
+function guessMime(name: string): string {
+  const ext = name.toLowerCase().split('.').pop();
+  switch (ext) {
+    case 'csv':  return 'text/csv';
+    case 'json': return 'application/json';
+    case 'txt':  return 'text/plain';
+    case 'pdf':  return 'application/pdf';
+    case 'png':  return 'image/png';
+    case 'jpg':
+    case 'jpeg': return 'image/jpeg';
+    case 'html': return 'text/html';
+    case 'xml':  return 'application/xml';
+    default:     return 'application/octet-stream';
+  }
 }

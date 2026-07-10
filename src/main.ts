@@ -2,7 +2,7 @@
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { createConnection } from './ws/connection.js';
-import { createEchoExecutor } from './runner/executor.js';
+import { createRealExecutor } from './runner/executor.js';
 import type { AdminToRuntime } from './protocol/ws.js';
 
 /**
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   );
 
   const conn = createConnection(config, log);
-  const executor = createEchoExecutor(log);
+  const executor = createRealExecutor(log);
 
   conn.on('message', (msg: AdminToRuntime) => {
     switch (msg.type) {
