@@ -78,6 +78,25 @@ function deriveWsUrl(adminUrl: string): string {
 export function loadConfig(): Config {
   const fileConfig = readSystemConfig();
 
+  // Merge file config into process.env so third-party libraries that
+  // read env vars directly can see the same values.
+  //
+  // On Linux, systemd's `EnvironmentFile=` already injects these into
+  // the process environment, so this loop is a no-op. On Windows,
+  // NSSM only sets what's in AppEnvironmentExtra — the file we read
+  // above is otherwise invisible to Playwright (looking for
+  // PLAYWRIGHT_BROWSERS_PATH) and to our own executor (checking
+  // process.env.HEADLESS). Without this merge, browser-type runs
+  // fail with "Chromium binary is missing" on Windows.
+  //
+  // Env vars set upstream (systemd, NSSM AppEnvironmentExtra, dev
+  // shell) win — we only fill blanks.
+  for (const [k, v] of Object.entries(fileConfig)) {
+    if (process.env[k] === undefined) {
+      process.env[k] = v;
+    }
+  }
+
   const adminUrl = require('ADMIN_URL', fileConfig);
   const enrollmentToken = require('ENROLLMENT_TOKEN', fileConfig);
 
