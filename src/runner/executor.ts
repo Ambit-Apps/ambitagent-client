@@ -294,7 +294,27 @@ function createRuntimeCtx({
        */
       async complete(opts: {
         system?: string;
-        messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+        messages: Array<{
+          role: 'user' | 'assistant';
+          /**
+           * Plain text or an array of blocks for vision (image + text).
+           * The proxy validates block shapes; the runtime just passes
+           * through.
+           */
+          content:
+            | string
+            | Array<
+                | { type: 'text'; text: string }
+                | {
+                    type: 'image';
+                    source: {
+                      type: 'base64';
+                      media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+                      data: string;
+                    };
+                  }
+              >;
+        }>;
         maxTokens?: number;
         temperature?: number;
         model?: string;
