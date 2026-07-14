@@ -243,6 +243,27 @@ function createRuntimeCtx({
     inputs: inputs ?? {},
     dryRun: false,
 
+    /**
+     * Customer-uploaded files are stored on the admin side; the
+     * runtime fetches by key via an authed API call. Not wired yet
+     * — browser agents that need input files should upload
+     * server-side for now. When we wire this, it'll be a GET to
+     * `/rest/runs/:runId/input-files/:key` with the enrollment
+     * token (same auth as ctx.ai.complete).
+     */
+    files: {
+      async getFile(key: string): Promise<Uint8Array | null> {
+        throw new Error(
+          `ctx.files.getFile("${key}"): input-file fetch is not yet wired ` +
+            `on the runtime side. API-type agents handle this today; ` +
+            `browser-type file inputs land next.`,
+        );
+      },
+      async getFileMeta(): Promise<null> {
+        return null;
+      },
+    },
+
     credentials(id: string) {
       const bundle = credentials[id];
       if (!bundle) {
