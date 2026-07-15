@@ -305,6 +305,56 @@ function createRuntimeCtx({
       });
     },
 
+    /**
+     * Product-lookup proxy. Same auth + tenant-isolation model as
+     * ai.complete — POST to the admin's `/rest/products/lookup-by-image`
+     * with our enrollment token. The admin loads the input-file bytes
+     * from the task_run and runs the eBay + Vision + Claude chain
+     * server-side. Runtimes never hold eBay app credentials or AWS
+     * keys — same principle as ai.complete.
+     */
+    products: {
+      async lookupByImage(
+        inputKey: string,
+        options?: {
+          minMatches?: number;
+          maxMatches?: number;
+          categoryHint?: string;
+        },
+      ): Promise<unknown> {
+        if (typeof inputKey !== 'string' || inputKey.length === 0) {
+          throw new Error('ctx.products.lookupByImage: inputKey (string) is required');
+        }
+        const url = `${config.adminUrl.replace(/\/$/, '')}/rest/products/lookup-by-image`;
+        let res: Response;
+        try {
+          res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${config.enrollmentToken}`,
+            },
+            body: JSON.stringify({
+              runId,
+              input_key: inputKey,
+              options: options ?? {},
+            }),
+          });
+        } catch (err) {
+          throw new Error(
+            `ctx.products.lookupByImage: request to ${url} failed: ${(err as Error).message}`,
+          );
+        }
+        if (!res.ok) {
+          const bodyText = await res.text().catch(() => '');
+          throw new Error(
+            `ctx.products.lookupByImage: admin returned ${res.status}: ${bodyText || res.statusText}`,
+          );
+        }
+        return await res.json();
+      },
+    },
+
     ai: {
       /**
        * Runtimes never hold AWS credentials. We POST to the admin's
