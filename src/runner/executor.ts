@@ -1,6 +1,6 @@
 import { register } from 'tsx/esm/api';
 import { mkdtemp, mkdir, writeFile, symlink, rm, readdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Page } from 'playwright';
@@ -137,7 +137,19 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
         // headless server installs (no X server / no framebuffer).
         if (isBrowserType) {
           const headless = process.env.HEADLESS === 'true';
-          browser = await launchBrowser({ headless });
+          // Persistent-profile opt-in: a bundle marks itself with the
+          // `@ambit:persistent-profile` comment (e.g. vendoo-lister, so a
+          // customer's Vendoo login survives across runs). Keyed per
+          // runtime install — one customer per machine, so a single named
+          // dir under ~/.ambit/profiles is already per-customer isolated.
+          const persistentProfileDir = bundleWantsPersistentProfile(msg)
+            ? join(homedir(), '.ambit', 'profiles', profileNameFor(msg))
+            : undefined;
+          if (persistentProfileDir) {
+            await mkdir(persistentProfileDir, { recursive: true });
+            log.info({ runId: msg.runId, persistentProfileDir }, 'launching with persistent profile');
+          }
+          browser = await launchBrowser({ headless, persistentProfileDir });
         }
 
         // 5) Dynamic-import the entry.
@@ -182,7 +194,9 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           payload: { message: e.message, stack: e.stack },
         });
       } finally {
-        if (browser) {
+        // AMBIT_KEEP_OPEN=1 leaves the browser up after the run (useful when
+        // attached to a real Chrome so the operator can inspect the result).
+        if (browser && process.env.AMBIT_KEEP_OPEN !== '1') {
           try { await browser.close(); } catch { /* ignore */ }
         }
         try {
@@ -433,6 +447,79 @@ function createRuntimeCtx({
       return uploadArtifact(buf, name.slice(0, 255) || 'artifact.bin', mime.slice(0, 128));
     },
 
+    // Input files the run was triggered with (e.g. the item photo the
+    // vendoo-lister uploads into Vendoo). Backed by the admin's
+    // enrollment-token-authed `/rest/runs/:runId/input-files/:key`.
+    files: {
+      async getFile(key: string): Promise<Uint8Array | null> {
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`ctx.files.getFile("${key}"): admin returned ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+      },
+      async getFileMeta(key: string) {
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`ctx.files.getFileMeta("${key}"): admin returned ${res.status}`);
+        const buf = await res.arrayBuffer();
+        return {
+          name: res.headers.get('x-ambit-file-name') ?? key,
+          mime_type: res.headers.get('content-type') ?? 'application/octet-stream',
+          size_bytes: buf.byteLength,
+        };
+      },
+    },
+
+    // Listing-draft I/O — the cross-marketplace pipeline spine. REST to
+    // the admin's runtime-authed endpoints.
+    listing: {
+      async create(input: {
+        fields: unknown;
+        status?: 'draft' | 'needs_review';
+        photoArtifactKeys?: string[];
+        sourceRunId?: number;
+      }) {
+        const res = await adminFetch(config, '/rest/listing-drafts/runtime', {
+          method: 'POST',
+          body: {
+            fields: input.fields,
+            status: input.status,
+            photo_artifact_keys: input.photoArtifactKeys,
+            source_run_id: input.sourceRunId ?? Number(runId),
+          },
+        });
+        return unwrapDraft(res, 'create');
+      },
+      async get(id: number) {
+        const res = await adminFetch(config, `/rest/listing-drafts/runtime/${id}`);
+        return unwrapDraft(res, 'get');
+      },
+      async update(id: number, patch: unknown) {
+        const res = await adminFetch(config, `/rest/listing-drafts/runtime/${id}`, {
+          method: 'PATCH',
+          body: patch,
+        });
+        return unwrapDraft(res, 'update');
+      },
+      async waitForConfirmation(id: number, opts?: { timeoutMs?: number; pollMs?: number }) {
+        const timeoutMs = opts?.timeoutMs ?? 5 * 60_000;
+        const pollMs = opts?.pollMs ?? 4_000;
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const res = await adminFetch(config, `/rest/listing-drafts/runtime/${id}`);
+          const draft = await unwrapDraft(res, 'waitForConfirmation');
+          if (draft.status === 'confirmed') return draft;
+          if (draft.status === 'failed' || draft.status === 'listed' || draft.status === 'listing') {
+            throw new Error(`listing draft ${id} is ${draft.status}, not awaiting confirmation`);
+          }
+          if (Date.now() > deadline) {
+            throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for draft ${id} to be confirmed`);
+          }
+          await new Promise((r) => setTimeout(r, pollMs));
+        }
+      },
+    },
+
     // Browser-only surface. Undefined on api-type ctx.
     page,
     uploadScreenshot: page
@@ -466,6 +553,53 @@ async function bundleUsesPlaywright(msg: RunTaskMessage): Promise<boolean> {
   const main = msg.files.find((f) => f.path === 'src/main.ts');
   if (!main) return false;
   return /ctx\.page|ctx\.uploadScreenshot/.test(main.contents);
+}
+
+/**
+ * Persistent-profile opt-in marker. A bundle whose entry file contains
+ * `@ambit:persistent-profile` (optionally `@ambit:persistent-profile:NAME`)
+ * launches with a reused userDataDir instead of a fresh one.
+ *
+ * SCAFFOLD: the durable mechanism is a manifest flag carried in the
+ * `run_task` message; the marker keeps the runtime honest until then.
+ */
+function bundleWantsPersistentProfile(msg: RunTaskMessage): boolean {
+  const main = msg.files.find((f) => f.path === 'src/main.ts');
+  return !!main && /@ambit:persistent-profile/.test(main.contents);
+}
+
+function profileNameFor(msg: RunTaskMessage): string {
+  const main = msg.files.find((f) => f.path === 'src/main.ts');
+  const m = main?.contents.match(/@ambit:persistent-profile:([a-z0-9_-]+)/i);
+  return (m?.[1] ?? 'default').toLowerCase();
+}
+
+/** Authed fetch to the admin, carrying the runtime enrollment token. */
+async function adminFetch(
+  config: ExecutorConfig,
+  path: string,
+  opts?: { method?: string; body?: unknown },
+): Promise<Response> {
+  const url = `${config.adminUrl.replace(/\/$/, '')}${path}`;
+  return fetch(url, {
+    method: opts?.method ?? 'GET',
+    headers: {
+      authorization: `Bearer ${config.enrollmentToken}`,
+      ...(opts?.body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+}
+
+/** Parse a `{ listing_draft }` response, throwing a useful error otherwise. */
+async function unwrapDraft(res: Response, op: string): Promise<{ status: string; [k: string]: unknown }> {
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`ctx.listing.${op}: admin returned ${res.status}: ${text || res.statusText}`);
+  }
+  const json = (await res.json()) as { listing_draft?: { status: string } };
+  if (!json.listing_draft) throw new Error(`ctx.listing.${op}: response missing listing_draft`);
+  return json.listing_draft as { status: string; [k: string]: unknown };
 }
 
 function guessMime(name: string): string {

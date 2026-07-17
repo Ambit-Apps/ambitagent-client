@@ -1,4 +1,5 @@
 import { chromium } from 'playwright-extra';
+import { chromium as pwChromium } from 'playwright';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, BrowserContext, Page } from 'playwright';
 
@@ -19,31 +20,130 @@ import type { Browser, BrowserContext, Page } from 'playwright';
  *   - No `userDataDir` → Playwright creates a fresh temp profile per
  *     launch, cleaned up on close(). The customer's real browser
  *     profile is never touched.
+ *
+ * Persistent-profile opt-in: pass `persistentProfileDir` to reuse a
+ * logged-in session across runs (e.g. a customer's Vendoo login for the
+ * vendoo-lister agent). This uses `launchPersistentContext`, keyed by a
+ * per-customer/runtime directory. It is OPT-IN — every other agent keeps
+ * the fresh-temp-profile isolation above.
+ *
+ * Launch toggles (env-driven, mirror dev-runner/src/lib/browser.mjs) —
+ * for targets that don't render / detect automation under the bundled
+ * stealth Chromium (e.g. Vendoo garbles fonts; Google OAuth blocks):
+ *   AMBIT_NO_STEALTH=1          skip the stealth plugin.
+ *   AMBIT_CHROME_CHANNEL=chrome use installed system Chrome (real fonts).
+ *     Still isolated: a persistent `userDataDir` keeps it off the user's
+ *     default profile.
+ * The default is unchanged — bundled Chromium + stealth + fresh profile —
+ * so existing agents behave exactly as before.
  */
 
-chromium.use(StealthPlugin());
+const USE_STEALTH = process.env.AMBIT_NO_STEALTH !== '1';
+const CHROME_CHANNEL = process.env.AMBIT_CHROME_CHANNEL || undefined;
+if (USE_STEALTH) chromium.use(StealthPlugin());
+
+// Strip the automation fingerprint Chrome advertises by default. This is
+// what sites like Google sniff ("this browser may not be secure"). Reduces
+// detection but does not fully defeat Google OAuth — the agent should only
+// need a Vendoo email/password session, not Google, in the automated browser.
+// AMBIT_BROWSER_ARGS: extra space-separated Chromium flags (e.g.
+// "--disable-gpu" to force software rendering when head-full text
+// rasterizes as garbled on screen — the DOM/screenshots are unaffected).
+const EXTRA_ARGS = (process.env.AMBIT_BROWSER_ARGS || '').split(/\s+/).filter(Boolean);
+const ANTI_AUTOMATION = {
+  args: ['--disable-blink-features=AutomationControlled', ...EXTRA_ARGS],
+  ignoreDefaultArgs: ['--enable-automation'],
+};
 
 export interface BrowserHandle {
   page: Page;
   context: BrowserContext;
-  browser: Browser;
+  browser: Browser | null;
   close: () => Promise<void>;
 }
 
+export interface LaunchOptions {
+  headless?: boolean;
+  /** When set, launch a PERSISTENT context at this dir so cookies /
+   *  logins survive across runs. Omit for the default fresh profile. */
+  persistentProfileDir?: string;
+}
+
+const missingBinary = (err: unknown): boolean =>
+  /Executable doesn't exist|Please run:/.test((err as Error)?.message ?? String(err));
+
+const BINARY_HINT =
+  'Playwright Chromium binary is missing on this runtime. ' +
+  'Install it with:  npx playwright install chromium';
+
 export async function launchBrowser(
-  { headless = true }: { headless?: boolean } = {},
+  { headless = true, persistentProfileDir }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
-  let browser: Browser;
-  try {
-    browser = await chromium.launch({ headless });
-  } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    if (/Executable doesn't exist|Please run:/.test(msg)) {
+  // ── Attach to a real, user-run Chrome over CDP ──
+  // AMBIT_ATTACH_CDP=http://localhost:9222 → drive the customer's own
+  // Chrome instead of an automated one. REQUIRED for Vendoo: its
+  // crosslisting extension can't be installed in a Playwright browser, and
+  // the real Chrome already has the extension + logins + correct rendering.
+  // Opens a NEW tab in the existing profile; never closes the user's Chrome.
+  const attachCdp = process.env.AMBIT_ATTACH_CDP;
+  if (attachCdp) {
+    let browser: Browser;
+    try {
+      browser = await pwChromium.connectOverCDP(attachCdp);
+    } catch (err) {
       throw new Error(
-        'Playwright Chromium binary is missing on this runtime. ' +
-          'Install it with:  npx playwright install chromium',
+        `Could not attach to Chrome at ${attachCdp}. Start Chrome with ` +
+          `--remote-debugging-port and a dedicated --user-data-dir, install the ` +
+          `Vendoo extension, and log in there. (${(err as Error)?.message ?? err})`,
       );
     }
+    const context = browser.contexts()[0] ?? (await browser.newContext());
+    const page = await context.newPage();
+    return {
+      page,
+      context,
+      browser,
+      // Close only our tab; the CDP connection drops on process exit. Never
+      // kill the customer's Chrome.
+      close: async () => { try { await page.close(); } catch { /* ignore */ } },
+    };
+  }
+
+  // ── Persistent profile: reuse a logged-in session across runs. ──
+  if (persistentProfileDir) {
+    let context: BrowserContext;
+    try {
+      context = await chromium.launchPersistentContext(persistentProfileDir, {
+        headless,
+        viewport: { width: 1440, height: 900 },
+        ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
+        ...ANTI_AUTOMATION,
+      });
+    } catch (err) {
+      if (missingBinary(err)) throw new Error(BINARY_HINT);
+      throw err;
+    }
+    const page = context.pages()[0] ?? (await context.newPage());
+    return {
+      page,
+      context,
+      browser: context.browser(),
+      close: async () => {
+        try { await context.close(); } catch { /* ignore */ }
+      },
+    };
+  }
+
+  // ── Default: fresh throwaway profile (full isolation). ──
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({
+      headless,
+      ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
+      ...ANTI_AUTOMATION,
+    });
+  } catch (err) {
+    if (missingBinary(err)) throw new Error(BINARY_HINT);
     throw err;
   }
 
