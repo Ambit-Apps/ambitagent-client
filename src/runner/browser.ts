@@ -24,11 +24,31 @@ import type { Browser, BrowserContext, Page } from 'playwright';
  * logged-in session across runs (e.g. a customer's Vendoo login for the
  * vendoo-lister agent). This uses `launchPersistentContext`, keyed by a
  * per-customer/runtime directory. It is OPT-IN — every other agent keeps
- * the fresh-temp-profile isolation above. Stealth + bundled Chromium
- * still apply.
+ * the fresh-temp-profile isolation above.
+ *
+ * Launch toggles (env-driven, mirror dev-runner/src/lib/browser.mjs) —
+ * for targets that don't render / detect automation under the bundled
+ * stealth Chromium (e.g. Vendoo garbles fonts; Google OAuth blocks):
+ *   AMBIT_NO_STEALTH=1          skip the stealth plugin.
+ *   AMBIT_CHROME_CHANNEL=chrome use installed system Chrome (real fonts).
+ *     Still isolated: a persistent `userDataDir` keeps it off the user's
+ *     default profile.
+ * The default is unchanged — bundled Chromium + stealth + fresh profile —
+ * so existing agents behave exactly as before.
  */
 
-chromium.use(StealthPlugin());
+const USE_STEALTH = process.env.AMBIT_NO_STEALTH !== '1';
+const CHROME_CHANNEL = process.env.AMBIT_CHROME_CHANNEL || undefined;
+if (USE_STEALTH) chromium.use(StealthPlugin());
+
+// Strip the automation fingerprint Chrome advertises by default. This is
+// what sites like Google sniff ("this browser may not be secure"). Reduces
+// detection but does not fully defeat Google OAuth — the agent should only
+// need a Vendoo email/password session, not Google, in the automated browser.
+const ANTI_AUTOMATION = {
+  args: ['--disable-blink-features=AutomationControlled'],
+  ignoreDefaultArgs: ['--enable-automation'],
+};
 
 export interface BrowserHandle {
   page: Page;
@@ -61,6 +81,8 @@ export async function launchBrowser(
       context = await chromium.launchPersistentContext(persistentProfileDir, {
         headless,
         viewport: { width: 1440, height: 900 },
+        ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
+        ...ANTI_AUTOMATION,
       });
     } catch (err) {
       if (missingBinary(err)) throw new Error(BINARY_HINT);
@@ -80,7 +102,11 @@ export async function launchBrowser(
   // ── Default: fresh throwaway profile (full isolation). ──
   let browser: Browser;
   try {
-    browser = await chromium.launch({ headless });
+    browser = await chromium.launch({
+      headless,
+      ...(CHROME_CHANNEL ? { channel: CHROME_CHANNEL } : {}),
+      ...ANTI_AUTOMATION,
+    });
   } catch (err) {
     if (missingBinary(err)) throw new Error(BINARY_HINT);
     throw err;
