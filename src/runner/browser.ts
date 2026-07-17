@@ -19,6 +19,13 @@ import type { Browser, BrowserContext, Page } from 'playwright';
  *   - No `userDataDir` → Playwright creates a fresh temp profile per
  *     launch, cleaned up on close(). The customer's real browser
  *     profile is never touched.
+ *
+ * Persistent-profile opt-in: pass `persistentProfileDir` to reuse a
+ * logged-in session across runs (e.g. a customer's Vendoo login for the
+ * vendoo-lister agent). This uses `launchPersistentContext`, keyed by a
+ * per-customer/runtime directory. It is OPT-IN — every other agent keeps
+ * the fresh-temp-profile isolation above. Stealth + bundled Chromium
+ * still apply.
  */
 
 chromium.use(StealthPlugin());
@@ -26,24 +33,56 @@ chromium.use(StealthPlugin());
 export interface BrowserHandle {
   page: Page;
   context: BrowserContext;
-  browser: Browser;
+  browser: Browser | null;
   close: () => Promise<void>;
 }
 
+export interface LaunchOptions {
+  headless?: boolean;
+  /** When set, launch a PERSISTENT context at this dir so cookies /
+   *  logins survive across runs. Omit for the default fresh profile. */
+  persistentProfileDir?: string;
+}
+
+const missingBinary = (err: unknown): boolean =>
+  /Executable doesn't exist|Please run:/.test((err as Error)?.message ?? String(err));
+
+const BINARY_HINT =
+  'Playwright Chromium binary is missing on this runtime. ' +
+  'Install it with:  npx playwright install chromium';
+
 export async function launchBrowser(
-  { headless = true }: { headless?: boolean } = {},
+  { headless = true, persistentProfileDir }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
+  // ── Persistent profile: reuse a logged-in session across runs. ──
+  if (persistentProfileDir) {
+    let context: BrowserContext;
+    try {
+      context = await chromium.launchPersistentContext(persistentProfileDir, {
+        headless,
+        viewport: { width: 1440, height: 900 },
+      });
+    } catch (err) {
+      if (missingBinary(err)) throw new Error(BINARY_HINT);
+      throw err;
+    }
+    const page = context.pages()[0] ?? (await context.newPage());
+    return {
+      page,
+      context,
+      browser: context.browser(),
+      close: async () => {
+        try { await context.close(); } catch { /* ignore */ }
+      },
+    };
+  }
+
+  // ── Default: fresh throwaway profile (full isolation). ──
   let browser: Browser;
   try {
     browser = await chromium.launch({ headless });
   } catch (err) {
-    const msg = (err as Error)?.message ?? String(err);
-    if (/Executable doesn't exist|Please run:/.test(msg)) {
-      throw new Error(
-        'Playwright Chromium binary is missing on this runtime. ' +
-          'Install it with:  npx playwright install chromium',
-      );
-    }
+    if (missingBinary(err)) throw new Error(BINARY_HINT);
     throw err;
   }
 
