@@ -1,4 +1,5 @@
 import { chromium } from 'playwright-extra';
+import { chromium as pwChromium } from 'playwright';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, BrowserContext, Page } from 'playwright';
 
@@ -78,6 +79,36 @@ const BINARY_HINT =
 export async function launchBrowser(
   { headless = true, persistentProfileDir }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
+  // ── Attach to a real, user-run Chrome over CDP ──
+  // AMBIT_ATTACH_CDP=http://localhost:9222 → drive the customer's own
+  // Chrome instead of an automated one. REQUIRED for Vendoo: its
+  // crosslisting extension can't be installed in a Playwright browser, and
+  // the real Chrome already has the extension + logins + correct rendering.
+  // Opens a NEW tab in the existing profile; never closes the user's Chrome.
+  const attachCdp = process.env.AMBIT_ATTACH_CDP;
+  if (attachCdp) {
+    let browser: Browser;
+    try {
+      browser = await pwChromium.connectOverCDP(attachCdp);
+    } catch (err) {
+      throw new Error(
+        `Could not attach to Chrome at ${attachCdp}. Start Chrome with ` +
+          `--remote-debugging-port and a dedicated --user-data-dir, install the ` +
+          `Vendoo extension, and log in there. (${(err as Error)?.message ?? err})`,
+      );
+    }
+    const context = browser.contexts()[0] ?? (await browser.newContext());
+    const page = await context.newPage();
+    return {
+      page,
+      context,
+      browser,
+      // Close only our tab; the CDP connection drops on process exit. Never
+      // kill the customer's Chrome.
+      close: async () => { try { await page.close(); } catch { /* ignore */ } },
+    };
+  }
+
   // ── Persistent profile: reuse a logged-in session across runs. ──
   if (persistentProfileDir) {
     let context: BrowserContext;
