@@ -45,8 +45,12 @@ if (USE_STEALTH) chromium.use(StealthPlugin());
 // what sites like Google sniff ("this browser may not be secure"). Reduces
 // detection but does not fully defeat Google OAuth — the agent should only
 // need a Vendoo email/password session, not Google, in the automated browser.
+// AMBIT_BROWSER_ARGS: extra space-separated Chromium flags (e.g.
+// "--disable-gpu" to force software rendering when head-full text
+// rasterizes as garbled on screen — the DOM/screenshots are unaffected).
+const EXTRA_ARGS = (process.env.AMBIT_BROWSER_ARGS || '').split(/\s+/).filter(Boolean);
 const ANTI_AUTOMATION = {
-  args: ['--disable-blink-features=AutomationControlled'],
+  args: ['--disable-blink-features=AutomationControlled', ...EXTRA_ARGS],
   ignoreDefaultArgs: ['--enable-automation'],
 };
 
