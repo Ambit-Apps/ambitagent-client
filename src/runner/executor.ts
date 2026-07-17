@@ -194,7 +194,9 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           payload: { message: e.message, stack: e.stack },
         });
       } finally {
-        if (browser) {
+        // AMBIT_KEEP_OPEN=1 leaves the browser up after the run (useful when
+        // attached to a real Chrome so the operator can inspect the result).
+        if (browser && process.env.AMBIT_KEEP_OPEN !== '1') {
           try { await browser.close(); } catch { /* ignore */ }
         }
         try {
