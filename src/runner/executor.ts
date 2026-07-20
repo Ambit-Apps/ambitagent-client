@@ -1,6 +1,6 @@
 import { register } from 'tsx/esm/api';
 import { mkdtemp, mkdir, writeFile, symlink, rm, readdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Page } from 'playwright';
@@ -41,11 +41,21 @@ export interface Executor {
   runTask(msg: RunTaskMessage, emit: (event: RunEventMessage) => void): Promise<void>;
 }
 
+import type { ChromeManager } from '../chrome/manager.js';
+
 export interface ExecutorConfig {
   /** Base URL of the admin API — used for the ctx.ai.complete proxy. */
   adminUrl: string;
   /** Sent as `Authorization: Bearer <token>` on proxy calls. */
   enrollmentToken: string;
+  /**
+   * Daemon-managed Chrome. When the running agent's manifest declares
+   * `browser.model: "attached_chrome"`, the executor awaits this manager
+   * for a live CDP URL rather than requiring the operator to set
+   * AMBIT_ATTACH_CDP by hand. The env var still wins if it's set
+   * (dev override).
+   */
+  chrome: ChromeManager;
 }
 
 const nowTs = () => Date.now();
@@ -137,7 +147,46 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
         // headless server installs (no X server / no framebuffer).
         if (isBrowserType) {
           const headless = process.env.HEADLESS === 'true';
-          browser = await launchBrowser({ headless });
+          // Persistent-profile opt-in: a bundle marks itself with the
+          // `@ambit:persistent-profile` comment (e.g. vendoo-lister, so a
+          // customer's Vendoo login survives across runs). Keyed per
+          // runtime install — one customer per machine, so a single named
+          // dir under ~/.ambit/profiles is already per-customer isolated.
+          const persistentProfileDir = bundleWantsPersistentProfile(msg)
+            ? join(homedir(), '.ambit', 'profiles', profileNameFor(msg))
+            : undefined;
+          if (persistentProfileDir) {
+            await mkdir(persistentProfileDir, { recursive: true });
+            log.info({ runId: msg.runId, persistentProfileDir }, 'launching with persistent profile');
+          }
+          // Manifest wins: msg.browser.model (from ambit.json → task_definitions
+          // → run_task) is authoritative. Absence means "no declaration" —
+          // launchBrowser falls back to env-var behavior for pre-Phase-1
+          // agents (AMBIT_ATTACH_CDP → attach, else Chromium).
+          const model = msg.browser?.model;
+          if (model) {
+            log.info({ runId: msg.runId, browserModel: model }, 'manifest-declared browser model');
+          }
+
+          // If the manifest says attach and the operator hasn't set
+          // AMBIT_ATTACH_CDP, wait for the daemon-managed Chrome to be
+          // ready and pass its URL down. The env var still wins if set
+          // (dev override / customer-managed debug Chrome).
+          let attachCdpUrl: string | undefined;
+          if (model === 'attached_chrome' && !process.env.AMBIT_ATTACH_CDP) {
+            log.info({ runId: msg.runId }, 'awaiting managed Chrome for attach-mode agent');
+            try {
+              attachCdpUrl = await config.chrome.whenReady();
+            } catch (err) {
+              throw new Error(
+                `Agent requires attached_chrome but the daemon-managed Chrome is not available: ` +
+                  `${(err as Error).message}. Install Google Chrome or set AMBIT_ATTACH_CDP to ` +
+                  `point at an already-running debug Chrome.`,
+              );
+            }
+          }
+
+          browser = await launchBrowser({ headless, persistentProfileDir, model, attachCdpUrl });
         }
 
         // 5) Dynamic-import the entry.
@@ -182,7 +231,9 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           payload: { message: e.message, stack: e.stack },
         });
       } finally {
-        if (browser) {
+        // AMBIT_KEEP_OPEN=1 leaves the browser up after the run (useful when
+        // attached to a real Chrome so the operator can inspect the result).
+        if (browser && process.env.AMBIT_KEEP_OPEN !== '1') {
           try { await browser.close(); } catch { /* ignore */ }
         }
         try {
@@ -242,27 +293,6 @@ function createRuntimeCtx({
   return {
     inputs: inputs ?? {},
     dryRun: false,
-
-    /**
-     * Customer-uploaded files are stored on the admin side; the
-     * runtime fetches by key via an authed API call. Not wired yet
-     * — browser agents that need input files should upload
-     * server-side for now. When we wire this, it'll be a GET to
-     * `/rest/runs/:runId/input-files/:key` with the enrollment
-     * token (same auth as ctx.ai.complete).
-     */
-    files: {
-      async getFile(key: string): Promise<Uint8Array | null> {
-        throw new Error(
-          `ctx.files.getFile("${key}"): input-file fetch is not yet wired ` +
-            `on the runtime side. API-type agents handle this today; ` +
-            `browser-type file inputs land next.`,
-        );
-      },
-      async getFileMeta(): Promise<null> {
-        return null;
-      },
-    },
 
     credentials(id: string) {
       const bundle = credentials[id];
@@ -433,6 +463,137 @@ function createRuntimeCtx({
       return uploadArtifact(buf, name.slice(0, 255) || 'artifact.bin', mime.slice(0, 128));
     },
 
+    // Input files the run was triggered with (e.g. the item photo the
+    // vendoo-lister uploads into Vendoo). Backed by the admin's
+    // enrollment-token-authed `/rest/runs/:runId/input-files/:key`.
+    files: {
+      async getFile(key: string): Promise<Uint8Array | null> {
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`ctx.files.getFile("${key}"): admin returned ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+      },
+      async getFileMeta(key: string) {
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`ctx.files.getFileMeta("${key}"): admin returned ${res.status}`);
+        const buf = await res.arrayBuffer();
+        return {
+          name: res.headers.get('x-ambit-file-name') ?? key,
+          mime_type: res.headers.get('content-type') ?? 'application/octet-stream',
+          size_bytes: buf.byteLength,
+        };
+      },
+    },
+
+    /**
+     * Human-in-the-loop pause. Creates (or finds by key) an approval row
+     * on the admin, then long-polls its status until the human submits,
+     * cancels, or the approval expires.
+     *
+     * Unlike the api-worker's version, the client executor keeps the
+     * script running (and the browser + WS connection open) while it
+     * waits. That works because runtimes are 1:1 with a customer session
+     * and the browser is already the observable proof-of-work. If a run
+     * takes 20 minutes to get approved, the tab sits idle on Vendoo for
+     * 20 minutes — cheap.
+     */
+    async awaitApproval(key: string, spec: {
+      title?: string;
+      description?: string;
+      renderer?: string;
+      payload: unknown;
+      attachments?: unknown[];
+      timeoutMs?: number;
+    }): Promise<{
+      action: 'submitted' | 'expired' | 'cancelled';
+      payload: unknown;
+      submittedBy?: { userId: number };
+      submittedAt?: string;
+    }> {
+      if (typeof key !== 'string' || key.length === 0) {
+        throw new Error('ctx.awaitApproval: key (string) is required');
+      }
+      if (!spec || typeof spec !== 'object') {
+        throw new Error('ctx.awaitApproval: spec is required');
+      }
+
+      // POST is upsert-on-(run_id, approval_key). Existing row returns
+      // as-is; a fresh row is created + task_run flipped to awaiting_input
+      // server-side. Either way we get the current state back.
+      const createRes = await adminFetch(config, '/rest/run-approvals/runtime', {
+        method: 'POST',
+        body: {
+          run_id: Number(runId),
+          approval_key: key,
+          title: spec.title,
+          description: spec.description,
+          renderer: spec.renderer,
+          payload: spec.payload,
+          attachments: spec.attachments,
+          expires_at:
+            typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0
+              ? new Date(Date.now() + spec.timeoutMs).toISOString()
+              : undefined,
+        },
+      });
+      if (!createRes.ok) {
+        const body = await createRes.text().catch(() => '');
+        throw new Error(
+          `ctx.awaitApproval: admin returned ${createRes.status}: ${body || createRes.statusText}`,
+        );
+      }
+      const created = (await createRes.json()) as {
+        run_approval: RunApprovalDTO;
+        created: boolean;
+      };
+      const approvalId = created.run_approval.id;
+
+      emit({
+        type: 'run_event',
+        runId,
+        kind: 'log',
+        ts: nowTs(),
+        payload: {
+          message: created.created
+            ? 'ctx.awaitApproval — paused, awaiting human review'
+            : 'ctx.awaitApproval — approval already exists, resuming polling',
+          approval_id: approvalId,
+          approval_key: key,
+          renderer: spec.renderer ?? null,
+        },
+      });
+
+      // Terminal on first read → return without polling.
+      const terminal = readTerminal(created.run_approval, spec.payload);
+      if (terminal) return terminal;
+
+      // Poll. 2s interval is snappy enough for humans without hammering
+      // the admin. Server-side timeout handles the eventual `expired`
+      // transition; we don't need our own client-side timeout in the loop.
+      const POLL_MS = 2_000;
+      for (;;) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        const pollRes = await adminFetch(
+          config,
+          `/rest/run-approvals/runtime/${approvalId}`,
+        );
+        if (!pollRes.ok) {
+          // Transient network / admin restart — log and keep polling.
+          // A truly persistent outage will eventually surface as a
+          // WS-connection drop and reconnect at the framework level.
+          log.warn(
+            { runId, approvalId, status: pollRes.status },
+            'ctx.awaitApproval: poll returned non-2xx, retrying',
+          );
+          continue;
+        }
+        const { run_approval } = (await pollRes.json()) as { run_approval: RunApprovalDTO };
+        const done = readTerminal(run_approval, spec.payload);
+        if (done) return done;
+      }
+    },
+
     // Browser-only surface. Undefined on api-type ctx.
     page,
     uploadScreenshot: page
@@ -466,6 +627,101 @@ async function bundleUsesPlaywright(msg: RunTaskMessage): Promise<boolean> {
   const main = msg.files.find((f) => f.path === 'src/main.ts');
   if (!main) return false;
   return /ctx\.page|ctx\.uploadScreenshot/.test(main.contents);
+}
+
+/**
+ * Persistent-profile opt-in marker. A bundle whose entry file contains
+ * `@ambit:persistent-profile` (optionally `@ambit:persistent-profile:NAME`)
+ * launches with a reused userDataDir instead of a fresh one.
+ *
+ * SCAFFOLD: the durable mechanism is a manifest flag carried in the
+ * `run_task` message; the marker keeps the runtime honest until then.
+ */
+function bundleWantsPersistentProfile(msg: RunTaskMessage): boolean {
+  const main = msg.files.find((f) => f.path === 'src/main.ts');
+  return !!main && /@ambit:persistent-profile/.test(main.contents);
+}
+
+function profileNameFor(msg: RunTaskMessage): string {
+  const main = msg.files.find((f) => f.path === 'src/main.ts');
+  const m = main?.contents.match(/@ambit:persistent-profile:([a-z0-9_-]+)/i);
+  return (m?.[1] ?? 'default').toLowerCase();
+}
+
+/** Authed fetch to the admin, carrying the runtime enrollment token. */
+async function adminFetch(
+  config: ExecutorConfig,
+  path: string,
+  opts?: { method?: string; body?: unknown },
+): Promise<Response> {
+  const url = `${config.adminUrl.replace(/\/$/, '')}${path}`;
+  return fetch(url, {
+    method: opts?.method ?? 'GET',
+    headers: {
+      authorization: `Bearer ${config.enrollmentToken}`,
+      ...(opts?.body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+}
+
+/**
+ * Wire shape of a `/rest/run-approvals/runtime` response row. Hand-mirrored
+ * from the admin's `packages/shared-protocol/src/rest.ts` — same
+ * vendoring pattern as the WS protocol types. Keep in sync by hand.
+ */
+interface RunApprovalDTO {
+  id: number;
+  tenant_id: number;
+  run_id: number;
+  approval_key: string;
+  status: 'awaiting_input' | 'submitted' | 'expired' | 'cancelled';
+  renderer: string | null;
+  title: string | null;
+  description: string | null;
+  payload: unknown;
+  submission: unknown;
+  attachments: unknown;
+  expires_at: string | null;
+  submitted_by_id: number | null;
+  submitted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * If the approval has reached a terminal state, return the shape
+ * `ctx.awaitApproval` promises the script. `submitted` returns the
+ * (possibly-edited) submission; the two non-happy terminals return the
+ * original staged payload so the script has something to fall back on
+ * even when it's about to unwind.
+ */
+function readTerminal(
+  row: RunApprovalDTO,
+  originalPayload: unknown,
+):
+  | {
+      action: 'submitted' | 'expired' | 'cancelled';
+      payload: unknown;
+      submittedBy?: { userId: number };
+      submittedAt?: string;
+    }
+  | null {
+  if (row.status === 'submitted') {
+    return {
+      action: 'submitted',
+      payload: row.submission ?? row.payload ?? originalPayload,
+      submittedBy: row.submitted_by_id != null ? { userId: row.submitted_by_id } : undefined,
+      submittedAt: row.submitted_at ?? undefined,
+    };
+  }
+  if (row.status === 'expired' || row.status === 'cancelled') {
+    return {
+      action: row.status,
+      payload: row.payload ?? originalPayload,
+    };
+  }
+  return null;
 }
 
 function guessMime(name: string): string {
