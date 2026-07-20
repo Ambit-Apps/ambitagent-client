@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 /**
@@ -30,6 +31,27 @@ export interface Config {
   reconnectMinDelayMs: number;
   reconnectMaxDelayMs: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+
+  /**
+   * Managed-Chrome lifecycle knobs — the daemon launches and monitors a
+   * dedicated Chrome (separate profile, dedicated debug port) so agents
+   * with `browser.model: "attached_chrome"` have somewhere to attach
+   * without operator gymnastics. Default: enabled on customer machines.
+   * Set `AMBIT_CHROME_ENABLED=false` on truly headless server VMs that
+   * only run api-type agents.
+   */
+  chromeEnabled: boolean;
+  /** Override the detected Chrome binary. Empty = auto-detect per OS. */
+  chromePath: string;
+  /** Debug port. Default 9222. */
+  chromePort: number;
+  /**
+   * Dedicated user-data-dir for the managed Chrome. Deliberately not the
+   * customer's personal Chrome profile — a fresh, isolated directory
+   * under `~/.ambit/chrome-profile` by default so extension installs +
+   * logins here never touch the customer's real browsing profile.
+   */
+  chromeProfileDir: string;
 }
 
 function readSystemConfig(): Record<string, string> {
@@ -102,6 +124,9 @@ export function loadConfig(): Config {
 
   const logLevel = optional('LOG_LEVEL', fileConfig, 'info') as Config['logLevel'];
 
+  const chromeEnabledRaw = optional('AMBIT_CHROME_ENABLED', fileConfig, 'true').toLowerCase();
+  const chromeEnabled = chromeEnabledRaw !== 'false' && chromeEnabledRaw !== '0';
+
   return {
     adminUrl,
     wsUrl: deriveWsUrl(adminUrl),
@@ -114,5 +139,14 @@ export function loadConfig(): Config {
     reconnectMinDelayMs: Number(optional('RECONNECT_MIN_DELAY_MS', fileConfig, '1000')),
     reconnectMaxDelayMs: Number(optional('RECONNECT_MAX_DELAY_MS', fileConfig, '30000')),
     logLevel,
+
+    chromeEnabled,
+    chromePath:       optional('AMBIT_CHROME_PATH', fileConfig, ''),
+    chromePort:       Number(optional('AMBIT_CHROME_PORT', fileConfig, '9222')),
+    chromeProfileDir: optional(
+      'AMBIT_CHROME_PROFILE_DIR',
+      fileConfig,
+      join(homedir(), '.ambit', 'chrome-profile'),
+    ),
   };
 }

@@ -74,6 +74,27 @@ export type AdminToRuntime =
   | CancelMessage
   | UpdateNowMessage;
 
+/**
+ * Browser configuration for a `runtime_type: browser` task. Sourced from
+ * the agent's `ambit.json` `browser` field. When absent, the runtime falls
+ * back to env-var behavior (backward compat with agents uploaded before
+ * this field existed).
+ *
+ * `attached_chrome` — the runtime attaches to a customer-managed Chrome
+ *   over CDP. Required for sites with bot detection, 2FA, mandatory
+ *   browser extensions (Vendoo), and Google OAuth flows.
+ * `chromium` — Playwright's bundled Chromium in a fresh temp profile.
+ *   Legacy default; keep only for unattended scraping / internal tools
+ *   with no bot detection surface.
+ *
+ * MUST stay in sync with the admin's `packages/shared-protocol/src/ws.ts`.
+ */
+export interface BrowserSpec {
+  model: 'attached_chrome' | 'chromium';
+  required_extensions?: string[];
+  required_logins?: string[];
+}
+
 export interface RunTaskMessage {
   type: 'run_task';
   runId: string;
@@ -95,6 +116,12 @@ export interface RunTaskMessage {
   credentials?: Record<string, Record<string, string>>;
   /** @deprecated use `credentials` — kept temporarily for compat. */
   credentialBundleId?: string;
+  /**
+   * Browser mode + requirements for browser-type tasks. Optional so
+   * pre-Phase-1 agents (no `browser` field in their manifest) still work
+   * — the runtime falls back to its env-var-driven behavior in that case.
+   */
+  browser?: BrowserSpec;
 }
 
 export interface RunTaskFile {

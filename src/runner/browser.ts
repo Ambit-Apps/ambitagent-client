@@ -62,11 +62,36 @@ export interface BrowserHandle {
   close: () => Promise<void>;
 }
 
+/**
+ * Explicit browser mode. Sourced from the agent's `ambit.json` `browser`
+ * field (rides the `run_task` WS message). When set, the manifest wins
+ * over env vars. When unset (agents uploaded before Phase 1), the
+ * env-var branches below still apply for backward compat.
+ *
+ * `attached_chrome` — connect over CDP to a customer-managed Chrome.
+ *   Requires the connection URL. Phase 1 still reads it from
+ *   `AMBIT_ATTACH_CDP`; Phase 2 will have the daemon own Chrome lifecycle
+ *   and pass the URL directly.
+ * `chromium` — Playwright's bundled Chromium (the legacy default).
+ *   Fresh temp profile unless persistentProfileDir is set.
+ */
+export type BrowserModel = 'attached_chrome' | 'chromium';
+
 export interface LaunchOptions {
   headless?: boolean;
   /** When set, launch a PERSISTENT context at this dir so cookies /
    *  logins survive across runs. Omit for the default fresh profile. */
   persistentProfileDir?: string;
+  /** Manifest-declared browser mode. Wins over env-var-driven behavior. */
+  model?: BrowserModel;
+  /**
+   * CDP URL supplied by the caller (typically the daemon-managed Chrome
+   * from `ChromeManager.whenReady()`). When set, `attached_chrome` mode
+   * uses this instead of reading `AMBIT_ATTACH_CDP` from the env — Phase 2
+   * of the browser-model rollout removes the env-var requirement for
+   * customers running the daemon.
+   */
+  attachCdpUrl?: string;
 }
 
 const missingBinary = (err: unknown): boolean =>
@@ -77,24 +102,51 @@ const BINARY_HINT =
   'Install it with:  npx playwright install chromium';
 
 export async function launchBrowser(
-  { headless = true, persistentProfileDir }: LaunchOptions = {},
+  { headless = true, persistentProfileDir, model, attachCdpUrl }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
-  // ── Attach to a real, user-run Chrome over CDP ──
-  // AMBIT_ATTACH_CDP=http://localhost:9222 → drive the customer's own
-  // Chrome instead of an automated one. REQUIRED for Vendoo: its
-  // crosslisting extension can't be installed in a Playwright browser, and
-  // the real Chrome already has the extension + logins + correct rendering.
-  // Opens a NEW tab in the existing profile; never closes the user's Chrome.
-  const attachCdp = process.env.AMBIT_ATTACH_CDP;
-  if (attachCdp) {
+  // Precedence:
+  //   1. If the manifest declares model='attached_chrome', use attach mode
+  //      unconditionally. The URL comes from (in order):
+  //        a. the caller-supplied attachCdpUrl (Phase 2 daemon-managed Chrome)
+  //        b. AMBIT_ATTACH_CDP env var (dev override, or pre-Phase-2 installs)
+  //      Neither present = hard error.
+  //   2. If the manifest declares model='chromium', skip attach entirely
+  //      even if AMBIT_ATTACH_CDP is set (staff opted into Chromium; respect
+  //      that).
+  //   3. If the manifest doesn't declare a model (undefined — agents from
+  //      before Phase 1), fall back to env-var behavior: attach if
+  //      AMBIT_ATTACH_CDP is set, else launch Chromium.
+  const envAttachCdp = process.env.AMBIT_ATTACH_CDP;
+  const shouldAttach =
+    model === 'attached_chrome'
+      ? true
+      : model === 'chromium'
+        ? false
+        : Boolean(envAttachCdp || attachCdpUrl);
+
+  if (shouldAttach) {
+    // Env var wins over caller-supplied URL — that's the dev-override
+    // contract. Customers on the daemon-managed path don't set the env
+    // and get the manager's URL automatically.
+    const cdpUrl = envAttachCdp || attachCdpUrl;
+    if (!cdpUrl) {
+      throw new Error(
+        'Agent manifest declares browser.model="attached_chrome" but no CDP URL ' +
+          'is available. Either enable the daemon-managed Chrome ' +
+          '(AMBIT_CHROME_ENABLED=true — the default), install Google Chrome so the ' +
+          'daemon can launch it, or set AMBIT_ATTACH_CDP=http://localhost:9222 ' +
+          'pointing at a Chrome you launched yourself.',
+      );
+    }
     let browser: Browser;
     try {
-      browser = await pwChromium.connectOverCDP(attachCdp);
+      browser = await pwChromium.connectOverCDP(cdpUrl);
     } catch (err) {
       throw new Error(
-        `Could not attach to Chrome at ${attachCdp}. Start Chrome with ` +
-          `--remote-debugging-port and a dedicated --user-data-dir, install the ` +
-          `Vendoo extension, and log in there. (${(err as Error)?.message ?? err})`,
+        `Could not attach to Chrome at ${cdpUrl}. If this is the daemon-managed ` +
+          `Chrome, restart the daemon and check its startup logs. If this is your ` +
+          `own debug Chrome, verify it's running with --remote-debugging-port. ` +
+          `(${(err as Error)?.message ?? err})`,
       );
     }
     const context = browser.contexts()[0] ?? (await browser.newContext());
@@ -104,7 +156,8 @@ export async function launchBrowser(
       context,
       browser,
       // Close only our tab; the CDP connection drops on process exit. Never
-      // kill the customer's Chrome.
+      // kill the customer's Chrome (or the daemon-managed one — the daemon
+      // owns its lifecycle, not us).
       close: async () => { try { await page.close(); } catch { /* ignore */ } },
     };
   }

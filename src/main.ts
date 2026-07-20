@@ -3,6 +3,7 @@ import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { createConnection } from './ws/connection.js';
 import { createRealExecutor } from './runner/executor.js';
+import { startChromeManager } from './chrome/manager.js';
 import type { AdminToRuntime } from './protocol/ws.js';
 
 /**
@@ -28,10 +29,19 @@ async function main(): Promise<void> {
     'ambit-agent starting',
   );
 
+  // Bring up the managed Chrome first — Phase 2 of the browser-model
+  // rollout. When enabled (default on customer machines), the daemon
+  // launches its own dedicated Chrome in the background and passes the
+  // CDP URL to the executor. Attach-mode agents connect there without
+  // any env-var gymnastics. Headless server VMs with only api-type
+  // agents set AMBIT_CHROME_ENABLED=false and skip this.
+  const chrome = startChromeManager(config, log);
+
   const conn = createConnection(config, log);
   const executor = createRealExecutor(log, {
     adminUrl: config.adminUrl,
     enrollmentToken: config.enrollmentToken,
+    chrome,
   });
 
   conn.on('message', (msg: AdminToRuntime) => {
@@ -66,6 +76,10 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'shutdown signal received');
     await conn.stop();
+    // Kill the managed Chrome we launched so it doesn't outlive the
+    // daemon. If the operator was running their own Chrome via
+    // AMBIT_ATTACH_CDP, the manager is a no-op and this is a no-op too.
+    await chrome.stop();
     // Give in-flight logs a tick to flush, then exit.
     setTimeout(() => process.exit(0), 100);
   };
