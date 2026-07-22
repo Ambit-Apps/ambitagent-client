@@ -191,6 +191,23 @@ class RealChromeManager implements ChromeManager {
   private async start(): Promise<void> {
     if (this.state === 'stopped') return;
     this.state = 'starting';
+
+    // Adopt an existing debug Chrome if one is already listening on our
+    // port. Common transition case: an operator who used the old runbook
+    // and launched Chrome by hand starts the daemon; we shouldn't fight
+    // that. Also handles the case where the daemon restarts but Chrome
+    // survived (dev reload, brief crash), so we skip the double-launch.
+    // We do NOT own that Chrome's lifecycle in this case — no monitor
+    // loop, no restart, we just report the URL.
+    if (await this.pingCdp()) {
+      this.log.info(
+        { url: this.url },
+        'debug Chrome already running on our port — adopting it (lifecycle stays with whoever launched it)',
+      );
+      this.markReady();
+      return;
+    }
+
     this.log.info(
       { binary: this.binary, port: this.config.chromePort, userDataDir: this.config.chromeProfileDir },
       'launching managed Chrome',
@@ -234,7 +251,7 @@ class RealChromeManager implements ChromeManager {
     this.process = proc;
 
     proc.on('exit', (code, signal) => {
-      if (this.state === 'stopped') return; // clean shutdown
+      if ((this.state as State) === 'stopped') return; // clean shutdown
       this.log.warn({ code, signal }, 'managed Chrome exited unexpectedly');
       this.state = 'restarting';
       this.scheduleRestart();
@@ -248,7 +265,7 @@ class RealChromeManager implements ChromeManager {
     // timeout, then give up + restart.
     const startedAt = Date.now();
     while (Date.now() - startedAt < HEALTH_STARTUP_TIMEOUT_MS) {
-      if (this.state === 'stopped') return;
+      if ((this.state as State) === 'stopped') return;
       if (await this.pingCdp()) {
         this.markReady();
         return;
