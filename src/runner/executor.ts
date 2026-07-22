@@ -134,7 +134,12 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
                 2,
               ),
             );
-            await symlink(pkgDir, join(nodeModulesAmbit, pkg), 'dir');
+            // 'junction' on Windows: a real symlink ('dir') needs
+            // SeCreateSymbolicLinkPrivilege (admin / Developer Mode) and
+            // fails with EPERM on a normal customer install. NTFS junctions
+            // need no privilege and resolve identically for a local dir.
+            // POSIX ignores the distinction, so keep 'dir' there.
+            await symlink(pkgDir, join(nodeModulesAmbit, pkg), process.platform === 'win32' ? 'junction' : 'dir');
           }
         }
 
