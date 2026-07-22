@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { exec, spawn, type ChildProcess } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import type { Logger } from '../log.js';
 import type { Config } from '../config.js';
@@ -171,21 +171,71 @@ class RealChromeManager implements ChromeManager {
     if (this.healthTimer) clearInterval(this.healthTimer);
     const p = this.process;
     this.process = null;
-    if (p && !p.killed) {
-      p.kill('SIGTERM');
-      // Give it 3s to exit gracefully, then SIGKILL.
-      await new Promise<void>((r) => {
-        const t = setTimeout(() => {
-          try { p.kill('SIGKILL'); } catch { /* ignore */ }
-          r();
-        }, 3_000);
-        p.once('exit', () => {
-          clearTimeout(t);
-          r();
+
+    // Only kill Chrome if we launched it. If we adopted an existing
+    // debug Chrome at startup, `this.process` was never set — that
+    // Chrome's lifecycle belongs to whoever launched it, not to us.
+    if (p) {
+      if (process.platform === 'darwin') {
+        // The ChildProcess is `open` (already exited long ago). Find
+        // Chrome by our debug port and TERM it directly.
+        const chromePid = await this.findChromePid();
+        if (chromePid != null) {
+          try { process.kill(chromePid, 'SIGTERM'); } catch { /* already gone */ }
+          await this.waitForProcessExit(chromePid, 3_000);
+        }
+      } else if (!p.killed) {
+        p.kill('SIGTERM');
+        // Give Chrome 3s to exit gracefully, then SIGKILL.
+        await new Promise<void>((r) => {
+          const t = setTimeout(() => {
+            try { p.kill('SIGKILL'); } catch { /* ignore */ }
+            r();
+          }, 3_000);
+          p.once('exit', () => {
+            clearTimeout(t);
+            r();
+          });
         });
-      });
+      }
     }
+
     this.rejectPending(new Error('Chrome manager stopped'));
+  }
+
+  /**
+   * Find the Chrome process by the debug port it's listening on. Used
+   * only on macOS where we launch via `open` and don't have a live
+   * ChildProcess to send signals to. `lsof -ti :PORT` returns the PID
+   * (or empty on nothing listening). Returns null if not found.
+   */
+  private async findChromePid(): Promise<number | null> {
+    return new Promise<number | null>((resolve) => {
+      exec(`lsof -ti :${this.config.chromePort}`, (err, stdout) => {
+        if (err) return resolve(null);
+        const pid = Number.parseInt(stdout.trim().split('\n')[0], 10);
+        resolve(Number.isNaN(pid) ? null : pid);
+      });
+    });
+  }
+
+  /**
+   * Poll until the given PID no longer exists (via kill(pid, 0) signal
+   * probe), or SIGKILL it if it's still alive at the deadline. Used to
+   * confirm a SIGTERM took effect before returning from stop().
+   */
+  private async waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0); // signal 0 = existence check, no signal sent
+      } catch {
+        return; // process is gone
+      }
+      await sleep(100);
+    }
+    // Still alive at the deadline — escalate to SIGKILL.
+    try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
   }
 
   private async start(): Promise<void> {
@@ -238,11 +288,44 @@ class RealChromeManager implements ChromeManager {
     ];
 
     let proc: ChildProcess;
+    const isDarwin = process.platform === 'darwin';
     try {
-      proc = spawn(this.binary, args, {
-        stdio: 'ignore',
-        detached: false,
-      });
+      if (isDarwin) {
+        // Use LaunchServices via `open -n -a <bundle> --args ...` on macOS.
+        // Direct `child_process.spawn(chromeBinary, ...)` — even with
+        // `detached: true` — doesn't give Chrome the WindowServer / GUI-app
+        // registration it needs. Chrome-as-a-Node-child feels persistently
+        // sluggish for rendering and interaction even though nothing shows
+        // up as consuming CPU. `open -n` launches Chrome the same way
+        // double-clicking Chrome.app in Finder does.
+        //
+        // Two consequences we handle below:
+        //   • `open` exits immediately after launching Chrome, so we can't
+        //     use `proc.on('exit')` to detect Chrome dying. Chrome-death
+        //     detection moves entirely to `checkHealth()` polling — see
+        //     the darwin branch in that method.
+        //   • Shutdown can't use `proc.kill()` on the `open` ref either
+        //     (already exited). `stop()` uses `findChromePid()` (lsof on
+        //     the debug port) and delivers SIGTERM directly.
+        //
+        // `this.binary` is the Chrome executable path
+        // (…/Chrome.app/Contents/MacOS/Google Chrome); `open -a` needs the
+        // .app bundle path, which we derive by trimming the executable
+        // suffix.
+        const appBundle = this.binary.replace(/\.app\/Contents\/MacOS\/[^/]+$/, '.app');
+        const openArgs = ['-n', '-a', appBundle, '--args', ...args];
+        proc = spawn('/usr/bin/open', openArgs, { stdio: 'ignore' });
+      } else {
+        // Linux / Windows: direct spawn works fine — those platforms don't
+        // have macOS's GUI-app-vs-service distinction. `detached: true` +
+        // `unref()` gives Chrome its own process group and lets the daemon
+        // exit cleanly if it needs to.
+        proc = spawn(this.binary, args, {
+          stdio: 'ignore',
+          detached: true,
+        });
+        proc.unref();
+      }
     } catch (err) {
       this.log.error({ err: (err as Error).message }, 'failed to spawn Chrome');
       this.scheduleRestart();
@@ -250,12 +333,18 @@ class RealChromeManager implements ChromeManager {
     }
     this.process = proc;
 
-    proc.on('exit', (code, signal) => {
-      if ((this.state as State) === 'stopped') return; // clean shutdown
-      this.log.warn({ code, signal }, 'managed Chrome exited unexpectedly');
-      this.state = 'restarting';
-      this.scheduleRestart();
-    });
+    if (!isDarwin) {
+      // On Linux/Windows the ChildProcess IS Chrome — wire its exit event
+      // to trigger a restart. On darwin the ChildProcess is `open` (already
+      // exiting momentarily); we ignore its exit and rely on the health
+      // check to notice Chrome dying.
+      proc.on('exit', (code, signal) => {
+        if ((this.state as State) === 'stopped') return; // clean shutdown
+        this.log.warn({ code, signal }, 'managed Chrome exited unexpectedly');
+        this.state = 'restarting';
+        this.scheduleRestart();
+      });
+    }
     proc.on('error', (err) => {
       this.log.error({ err: err.message }, 'managed Chrome process error');
     });
@@ -308,16 +397,25 @@ class RealChromeManager implements ChromeManager {
     const ok = await this.pingCdp();
     if (!ok) {
       this.log.warn({ url: this.url }, 'managed Chrome health check failed');
-      // Kill the process to force the exit handler to schedule a restart.
-      // The exit handler is the single restart entry-point — don't call
-      // scheduleRestart() from here or we double-fire.
-      const p = this.process;
-      if (p && !p.killed) {
-        try { p.kill('SIGKILL'); } catch { /* ignore */ }
-      } else if (!p) {
-        // No process but state says ready — inconsistent, force-restart.
+      if (process.platform === 'darwin') {
+        // On macOS we don't hold a live ChildProcess for Chrome (it was
+        // launched via `open`, whose process has long since exited).
+        // Schedule the restart directly — the exit-handler pathway that
+        // Linux/Windows use isn't available here.
         this.state = 'restarting';
         this.scheduleRestart();
+      } else {
+        // On other platforms: kill our ChildProcess (which IS Chrome) so
+        // its exit handler fires and drives the restart. Single entry
+        // point avoids double-firing scheduleRestart.
+        const p = this.process;
+        if (p && !p.killed) {
+          try { p.kill('SIGKILL'); } catch { /* ignore */ }
+        } else if (!p) {
+          // No process but state says ready — inconsistent, force-restart.
+          this.state = 'restarting';
+          this.scheduleRestart();
+        }
       }
     }
   }

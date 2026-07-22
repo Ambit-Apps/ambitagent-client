@@ -155,10 +155,24 @@ export async function launchBrowser(
       page,
       context,
       browser,
-      // Close only our tab; the CDP connection drops on process exit. Never
-      // kill the customer's Chrome (or the daemon-managed one — the daemon
-      // owns its lifecycle, not us).
-      close: async () => { try { await page.close(); } catch { /* ignore */ } },
+      // Close our tab AND disconnect the CDP client — otherwise the
+      // WebSocket to Chrome's debug port lingers until the daemon process
+      // exits. Playwright's connectOverCDP implicitly subscribes to
+      // Runtime/Page/Network/Target events on every context and page it
+      // sees; every idle stale client makes Chrome serialize and dispatch
+      // those events to one more listener. Over dozens of runs on the
+      // long-lived daemon, that overhead compounds into "every click and
+      // idle frame feels sluggish" for both agents AND manual use of the
+      // shared managed Chrome.
+      //
+      // `browser.close()` on a connectOverCDP Browser only disconnects
+      // OUR client — it does not kill the underlying Chrome process. The
+      // daemon-managed Chrome (its tabs, cookies, extensions, and the
+      // customer's manual browsing) is unaffected.
+      close: async () => {
+        try { await page.close(); } catch { /* ignore */ }
+        try { await browser.close(); } catch { /* ignore */ }
+      },
     };
   }
 
