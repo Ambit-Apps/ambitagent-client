@@ -1,58 +1,70 @@
 #Requires -RunAsAdministrator
 #
-# Ambit Agent runtime -- Windows installer.
+# Ambit Agent runtime -- Windows installer (zip-distribution + user-session mode).
 #
-# What it does, in order:
-#   1.  Elevation is enforced by the #Requires directive above.
-#   2.  Collects ADMIN_URL + ENROLLMENT_TOKEN (env vars OR interactive prompts).
-#   3.  Installs Node.js LTS, Git, and NSSM via winget if missing.
-#   4.  Creates dirs under Program Files + ProgramData.
-#   5.  Clones (or updates) the client repo into "C:\Program Files\Ambit Agent\app".
-#   6.  Runs `npm ci` + `npm run build`.
-#   7.  Downloads Playwright Chromium into "C:\Program Files\Ambit Agent\browsers".
-#   8.  Writes "C:\ProgramData\Ambit Agent\config" with restrictive ACLs
-#       (SYSTEM + Administrators only).
-#   9.  Registers an NSSM-wrapped service `ambit-agent`, sets restart
-#       policy + log rotation, and starts it.
+# Design shape:
+#   - Runs the daemon as a Scheduled Task at user logon (NOT a Session-0
+#     service), so the managed Chrome window is visible on the user's
+#     desktop. Required by agents with browser.model="attached_chrome".
+#   - Extracts source from a sibling `ambitagent-client-*.zip` bundled
+#     alongside this .ps1 in the same folder (typically Downloads after
+#     the customer saves both email attachments). No git, no PAT, no
+#     public repo needed.
+#   - Idempotent: re-running upgrades the source in place, restarts the
+#     task, preserves the config file + Chrome profile (customer's
+#     Amazon/LMD logins survive upgrades).
 #
-# Usage -- one-liner from an elevated PowerShell prompt:
+# Usage -- one-time customer flow:
 #
-#   $env:AMBIT_ADMIN_URL='https://ambitagent-prod.example.com'
-#   $env:AMBIT_ENROLLMENT_TOKEN='<token-from-portal>'
-#   iwr https://raw.githubusercontent.com/Ambit-Apps/ambitagent-client/main/install/windows/install.ps1 -UseBasicParsing | iex
+#   1. Save both attachments from the install email into the SAME folder
+#      (typically Downloads):
+#         - install.ps1
+#         - ambitagent-client-YYYYMMDD-HHMMSS-SHA.zip
+#   2. Right-click install.ps1 -> Run with PowerShell (as Administrator).
+#   3. When prompted:
+#        - Admin URL:        <copied from email body>
+#        - Enrollment token: <copied from email body>
+#        - Run-as user:      <defaults to the current logged-in user;
+#                            usually just press Enter>
+#   4. Wait ~5 min (Node install + npm ci + Chromium download).
+#   5. Log OFF and back ON to trigger the "at logon" task (or just wait
+#      until tomorrow morning). Runtime appears online in portal /staff/runtimes.
 #
-# Or interactive (prompts for both values):
-#
-#   iwr https://.../install.ps1 -UseBasicParsing -OutFile install.ps1
-#   Get-Content install.ps1 | more   # review before running
-#   .\install.ps1
-#
-# Re-running is safe -- the script is idempotent (winget skips already-
-# installed packages, git fetch+reset updates the checkout in place,
-# and the service is torn down + reinstalled cleanly).
-#
-# --------------------------------------------------------------------
-# Overridable env vars (rarely needed):
-#   $env:AMBIT_CLIENT_GIT_URL   Where to clone from. Default: public Ambit-Apps repo.
-#   $env:AMBIT_CLIENT_REF       Branch / tag / commit. Default: main.
-#   $env:AMBIT_HEADLESS         true|false. Default: true. Windows services run in
-#                                Session 0 (no visible desktop) so headful browsers
-#                                would render invisibly regardless.
-#   $env:AMBIT_LOG_LEVEL        debug|info|warn|error. Default: info.
+# Overridable env vars (set BEFORE running the installer):
+#   $env:AMBIT_ADMIN_URL         Skips the prompt.
+#   $env:AMBIT_ENROLLMENT_TOKEN  Skips the prompt.
+#   $env:AMBIT_RUN_AS_USER       DOMAIN\username to run the task as.
+#                                Default: interactive user who invoked the script.
+#   $env:AMBIT_HEADLESS          true|false. Default: false (user session
+#                                CAN show visible Chrome, so let it).
+#   $env:AMBIT_LOG_LEVEL         debug|info|warn|error. Default: info.
 # --------------------------------------------------------------------
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
+# Force TLS 1.2 for any HTTPS the script itself makes. PowerShell 5.1
+# (which ships with Windows 10/11) defaults to TLS 1.0/1.1, which
+# npm/GitHub/most package registries no longer accept. The current
+# script doesn't make direct HTTPS calls (winget + node handle their
+# own TLS), but this is cheap insurance against a future addition and
+# means customers never have to prepend a TLS line before running.
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    # Tls13 enum missing on very old .NET (< 4.8) — fall back to Tls12 only.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
 $InstallRoot   = 'C:\Program Files\Ambit Agent'
 $AppDir        = Join-Path $InstallRoot 'app'
 $BrowsersDir   = Join-Path $InstallRoot 'browsers'
+$WrapperFile   = Join-Path $InstallRoot 'run-daemon.ps1'
 $DataDir       = 'C:\ProgramData\Ambit Agent'
 $LogsDir       = Join-Path $DataDir 'logs'
 $ConfigFile    = Join-Path $DataDir 'config'
-$ServiceName   = 'ambit-agent'
-$DefaultGitUrl = 'https://github.com/Ambit-Apps/ambitagent-client.git'
-$DefaultRef    = 'main'
+$TaskName      = 'AmbitAgentRuntime'
 
 function Write-Info { param($m) Write-Host "[install] $m" -ForegroundColor Cyan }
 function Write-Warn { param($m) Write-Host "[install] $m" -ForegroundColor Yellow }
@@ -61,14 +73,13 @@ function Write-Fail { param($m) Write-Host "[install] $m" -ForegroundColor Red; 
 # --- config source ---------------------------------------------------
 $AdminUrl        = if ($env:AMBIT_ADMIN_URL)        { $env:AMBIT_ADMIN_URL }        else { '' }
 $EnrollmentToken = if ($env:AMBIT_ENROLLMENT_TOKEN) { $env:AMBIT_ENROLLMENT_TOKEN } else { '' }
-$ClientGitUrl    = if ($env:AMBIT_CLIENT_GIT_URL)   { $env:AMBIT_CLIENT_GIT_URL }   else { $DefaultGitUrl }
-$ClientRef       = if ($env:AMBIT_CLIENT_REF)       { $env:AMBIT_CLIENT_REF }       else { $DefaultRef }
-$Headless        = if ($env:AMBIT_HEADLESS)         { $env:AMBIT_HEADLESS }         else { 'true' }
+$RunAsUser       = if ($env:AMBIT_RUN_AS_USER)      { $env:AMBIT_RUN_AS_USER }      else { '' }
+$Headless        = if ($env:AMBIT_HEADLESS)         { $env:AMBIT_HEADLESS }         else { 'false' }
 $LogLevel        = if ($env:AMBIT_LOG_LEVEL)        { $env:AMBIT_LOG_LEVEL }        else { 'info' }
 
 if (-not $AdminUrl) {
     if ([Environment]::UserInteractive) {
-        $AdminUrl = Read-Host 'Admin control-plane URL (e.g. https://api.ambitagent.com)'
+        $AdminUrl = Read-Host 'Admin control-plane URL (e.g. https://ambitagent-prod.herokuapp.com)'
     } else {
         Write-Fail 'AMBIT_ADMIN_URL not set and no interactive session for prompt.'
     }
@@ -84,66 +95,73 @@ if (-not $AdminUrl -or -not $EnrollmentToken) {
     Write-Fail 'ADMIN_URL and ENROLLMENT_TOKEN are both required.'
 }
 
-# --- prereqs ---------------------------------------------------------
-# Preference: winget on Windows 10/11 clients where it's available.
-# Fallback: on Windows Server (no App Installer) we require the three
-# tools to be pre-installed manually; we only fail if a prereq is
-# missing AND winget isn't there to install it. This lets the same
-# script drive both client and server installs.
+# The run-as user needs to match whoever will actually be logged into
+# this machine when runs are triggered. In UAC-elevated PowerShell, the
+# elevated session may be running as a different user than the logged-in
+# desktop user, so we take the *interactive* user as the default and
+# offer to override.
+$CurrentInteractiveUser = & whoami
+if (-not $RunAsUser) {
+    if ([Environment]::UserInteractive) {
+        $prompt = "Run task as user [default: $CurrentInteractiveUser]"
+        $entered = Read-Host $prompt
+        $RunAsUser = if ([string]::IsNullOrWhiteSpace($entered)) { $CurrentInteractiveUser } else { $entered }
+    } else {
+        $RunAsUser = $CurrentInteractiveUser
+    }
+}
+Write-Info "Task will run as: $RunAsUser (at that user's logon)"
+
+# --- payload discovery -----------------------------------------------
+# The installer must be able to find its zip next to itself. Handles two
+# invocation styles:
+#   - .\install.ps1 from an unpacked folder ($PSScriptRoot works)
+#   - Get-Content install.ps1 | Invoke-Expression ($PSScriptRoot is null;
+#     zip must then be in the current directory)
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+Write-Info "Looking for ambitagent-client-*.zip in $ScriptDir..."
+$Payload = Get-ChildItem $ScriptDir -Filter 'ambitagent-client-*.zip' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+if (-not $Payload) {
+    Write-Fail (
+        "No ambitagent-client-*.zip found in $ScriptDir. Save the .zip attachment " +
+        "from the install email into the SAME folder as this .ps1, then re-run."
+    )
+}
+Write-Info "Using payload: $($Payload.Name) ($([math]::Round($Payload.Length / 1KB)) KB)"
+
+# --- prereq: Node.js LTS ---------------------------------------------
 function Refresh-Path {
     $env:Path =
         [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
         [Environment]::GetEnvironmentVariable('Path', 'User')
 }
-
 $HasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
 
-function Ensure-Package {
-    param(
-        [string]$Id,
-        [string]$Name,
-        [scriptblock]$AlreadyThere,
-        [string]$ManualUrl
-    )
-    if (& $AlreadyThere) {
-        Write-Info "$Name already installed -- reusing."
-        return
+function Ensure-NodeLts {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ($node) {
+        $ver = & node -v
+        if ($ver -match '^v(\d+)' -and [int]$Matches[1] -ge 20) {
+            Write-Info "Node.js already installed ($ver) -- reusing."
+            return
+        }
+        Write-Warn "Node.js $ver is too old (need >= 20). Upgrading via winget..."
     }
     if (-not $HasWinget) {
         Write-Fail (
-            "$Name is not installed and winget is unavailable on this system " +
-            "(common on Windows Server). Install $Name manually from $ManualUrl " +
+            "Node.js LTS >= 20 is not installed and winget is unavailable. " +
+            "Install Node.js LTS x64 manually from https://nodejs.org/en/download/ " +
             "and re-run this script."
         )
     }
-    Write-Info "Installing $Name via winget..."
-    & winget install --id $Id -e --silent --accept-source-agreements --accept-package-agreements
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "winget install $Id failed (exit $LASTEXITCODE)."
-    }
+    Write-Info "Installing Node.js LTS via winget..."
+    & winget install --id OpenJS.NodeJS.LTS -e --silent --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Fail "winget install Node.js failed (exit $LASTEXITCODE)." }
     Refresh-Path
 }
-
-Ensure-Package -Id 'OpenJS.NodeJS.LTS' -Name 'Node.js LTS' `
-    -ManualUrl 'https://nodejs.org/en/download/ (pick LTS x64 .msi)' `
-    -AlreadyThere {
-        $node = Get-Command node -ErrorAction SilentlyContinue
-        if (-not $node) { return $false }
-        $ver = & node -v
-        return ($ver -match '^v(\d+)') -and ([int]$Matches[1] -ge 20)
-    }
-
-Ensure-Package -Id 'Git.Git' -Name 'Git' `
-    -ManualUrl 'https://git-scm.com/download/win' `
-    -AlreadyThere {
-        [bool](Get-Command git -ErrorAction SilentlyContinue)
-    }
-
-Ensure-Package -Id 'NSSM.NSSM' -Name 'NSSM' `
-    -ManualUrl 'https://nssm.cc/release/nssm-2.24.zip (extract nssm.exe to a folder on PATH)' `
-    -AlreadyThere {
-        [bool](Get-Command nssm -ErrorAction SilentlyContinue)
-    }
+Ensure-NodeLts
 
 # --- dirs ------------------------------------------------------------
 Write-Info "Preparing directories under $InstallRoot and $DataDir..."
@@ -151,24 +169,16 @@ foreach ($d in @($InstallRoot, $BrowsersDir, $DataDir, $LogsDir)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
-# --- daemon source ---------------------------------------------------
-if (Test-Path (Join-Path $AppDir '.git')) {
-    Write-Info "Updating existing checkout at $AppDir (ref=$ClientRef)..."
-    Push-Location $AppDir
-    try {
-        & git fetch --depth 1 origin $ClientRef
-        & git checkout -f $ClientRef
-        & git reset --hard "origin/$ClientRef"
-        if ($LASTEXITCODE -ne 0) { & git reset --hard $ClientRef }
-    } finally {
-        Pop-Location
-    }
-} else {
-    Write-Info "Cloning $ClientGitUrl @ $ClientRef into $AppDir..."
-    if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
-    & git clone --depth 1 --branch $ClientRef $ClientGitUrl $AppDir
-    if ($LASTEXITCODE -ne 0) { Write-Fail 'git clone failed.' }
+# --- extract source zip ----------------------------------------------
+# Wipe the previous $AppDir so stale files never sneak into a new
+# release. The Chrome profile lives in the user's home dir, NOT here,
+# so this doesn't touch customer sessions.
+if (Test-Path $AppDir) {
+    Write-Info "Removing previous $AppDir..."
+    Remove-Item -Recurse -Force $AppDir
 }
+Write-Info "Extracting $($Payload.Name) to $AppDir..."
+Expand-Archive -Path $Payload.FullName -DestinationPath $AppDir -Force
 
 # --- build -----------------------------------------------------------
 Push-Location $AppDir
@@ -182,9 +192,6 @@ try {
     if ($LASTEXITCODE -ne 0) { Write-Fail 'npm run build failed.' }
 
     Write-Info "Downloading Playwright Chromium into $BrowsersDir..."
-    # PLAYWRIGHT_BROWSERS_PATH controls where the browser is downloaded;
-    # sits under Program Files so ordinary users can't tamper with it
-    # and Windows Defender treats it as system-owned.
     $env:PLAYWRIGHT_BROWSERS_PATH = $BrowsersDir
     & npx playwright install chromium
     if ($LASTEXITCODE -ne 0) { Write-Fail 'playwright install chromium failed.' }
@@ -194,9 +201,6 @@ try {
 
 # --- config file -----------------------------------------------------
 Write-Info "Writing config to $ConfigFile..."
-
-# Same shell-style KEY=VALUE the Ubuntu installer produces. The daemon's
-# config loader (src/config.ts) reads either file based on process.platform.
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $configContent = @"
 # Ambit Agent runtime config. Written by install.ps1 at $stamp.
@@ -205,125 +209,128 @@ $configContent = @"
 ADMIN_URL=$AdminUrl
 ENROLLMENT_TOKEN=$EnrollmentToken
 
-# Windows services run in Session 0 with no visible desktop; a headful
-# Chromium would render invisible regardless. Keep true unless you have
-# a specific reason to change it.
+# User-session Task Scheduler mode: the managed Chrome window IS visible
+# on the user's desktop, so headful is fine (and required for the first
+# Amazon/LMD sign-in). Set true only if the customer wants Chrome
+# invisible and has already persisted sessions some other way.
 HEADLESS=$Headless
 
-# Playwright browser cache lives under Program Files, protected from
-# ordinary-user writes.
+# Playwright browser cache lives under Program Files (system-owned).
 PLAYWRIGHT_BROWSERS_PATH=$BrowsersDir
 
 LOG_LEVEL=$LogLevel
 "@
-
-# Write UTF-8 without BOM -- PS 5.1's Set-Content -Encoding utf8 emits
-# a BOM, and while the daemon's parser tolerates it (String.trim strips
-# ), avoiding it upfront is cleaner and matches Linux tooling.
 [System.IO.File]::WriteAllText(
     $ConfigFile,
     $configContent,
     [System.Text.UTF8Encoding]::new($false)
 )
 
-# ACL: SYSTEM + Administrators full control, nothing else. The service
-# runs as LocalSystem (see NSSM ObjectName below) so SYSTEM is the
-# effective read principal.
+# ACL on config: SYSTEM + Administrators full control, plus the run-as
+# user READ (they need to load env vars from it at task start).
 $acl = Get-Acl $ConfigFile
-$acl.SetAccessRuleProtection($true, $false)   # disable inheritance, purge parent ACEs
+$acl.SetAccessRuleProtection($true, $false)
 $acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
-$sysRule   = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    'NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')
-$adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    'BUILTIN\Administrators', 'FullControl', 'Allow')
-$acl.AddAccessRule($sysRule)
-$acl.AddAccessRule($adminRule)
+$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    'NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')))
+$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    'BUILTIN\Administrators', 'FullControl', 'Allow')))
+try {
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $RunAsUser, 'Read', 'Allow')))
+} catch {
+    Write-Warn "Could not add Read ACE for '$RunAsUser' (may be a computed / group name). Task will still run if the user is a local Administrator."
+}
 Set-Acl -Path $ConfigFile -AclObject $acl
 
-# --- NSSM service ----------------------------------------------------
-$nodeExe = (Get-Command node).Source
-$mainJs  = Join-Path $AppDir 'dist\main.js'
-if (-not (Test-Path $mainJs)) {
-    Write-Fail "Build output missing: $mainJs (did tsc succeed?)."
+# LogsDir ACL: the run-as user needs write access (the wrapper redirects
+# stdout/stderr there). Grant Modify to that user.
+try {
+    $logAcl = Get-Acl $LogsDir
+    $logAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $RunAsUser, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -Path $LogsDir -AclObject $logAcl
+} catch {
+    Write-Warn "Could not grant Modify on $LogsDir to '$RunAsUser'. Logs may fall back to the user's %TEMP%."
 }
 
-# Idempotence: teardown any existing service registration first, so we
-# don't accumulate config drift across reinstalls.
-if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
-    Write-Info "Stopping existing service $ServiceName..."
-    & nssm stop $ServiceName confirm | Out-Null
-    Start-Sleep -Seconds 2
-    Write-Info "Removing existing service registration..."
-    & nssm remove $ServiceName confirm | Out-Null
+# --- wrapper script --------------------------------------------------
+# Copy the sibling run-daemon.ps1 into $InstallRoot. The Scheduled Task
+# invokes this file (not node.exe directly) so we can source the config,
+# set env vars, and redirect stdout/stderr in one place.
+$SrcWrapper = Join-Path $ScriptDir 'run-daemon.ps1'
+if (-not (Test-Path $SrcWrapper)) {
+    Write-Fail (
+        "run-daemon.ps1 not found in $ScriptDir. This installer needs it " +
+        "alongside install.ps1 -- both should have arrived together in the install email."
+    )
+}
+Write-Info "Installing wrapper to $WrapperFile..."
+Copy-Item -Path $SrcWrapper -Destination $WrapperFile -Force
+
+# --- Scheduled Task registration -------------------------------------
+# Idempotence: remove any prior task before re-registering.
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Write-Info "Removing existing scheduled task $TaskName..."
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-Write-Info "Registering service $ServiceName (NSSM)..."
-& nssm install $ServiceName $nodeExe                                         | Out-Null
+Write-Info "Registering Scheduled Task '$TaskName' (at logon of $RunAsUser)..."
+$action = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperFile`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $RunAsUser
+# LogonType Interactive: task fires ONLY when the user has an interactive
+# session (visible desktop). Perfect for showing Chrome when a run
+# triggers, and no stored password required.
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $RunAsUser `
+    -LogonType Interactive `
+    -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)   # unlimited
+Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Description 'Ambit Agent runtime daemon (user-session mode). Idle until admin sends a run_task; launches managed Chrome for headful agent runs.' `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal `
+    -Settings $settings | Out-Null
 
-# NSSM concatenates AppParameters after the exe path when building the
-# child's command line. If the script path contains a space (which it
-# does -- "C:\Program Files\Ambit Agent\..."), Node's argv parser
-# splits on the unescaped space and fails with
-# `Cannot find module 'C:\Program'`.
-#
-# The fix is to store AppParameters WITH embedded quotes. But nssm's
-# CLI (`nssm set ... AppParameters "..."`) strips one layer of quotes
-# during Windows argv parsing before nssm ever sees them -- so the
-# quotes never make it into the registry. NSSM's own docs recommend
-# their GUI (`nssm edit`) for programs needing quoted args, which
-# isn't scriptable.
-#
-# Reliable workaround: write directly to the registry key where nssm
-# stores AppParameters. Set-ItemProperty preserves the value byte-for-
-# byte, quotes intact. nssm reads it back correctly at start time.
-$paramsKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
-Set-ItemProperty -Path $paramsKey -Name 'AppParameters' -Value "`"$mainJs`""
-
-& nssm set $ServiceName AppDirectory $AppDir                                 | Out-Null
-& nssm set $ServiceName DisplayName 'Ambit Agent Runtime'                    | Out-Null
-& nssm set $ServiceName Description 'Ambit Agent -- local runtime daemon for browser-type automation tasks.' | Out-Null
-& nssm set $ServiceName Start SERVICE_AUTO_START                             | Out-Null
-
-# Restart policy -- matches systemd's Restart=always, RestartSec=5.
-& nssm set $ServiceName AppExit Default Restart                              | Out-Null
-& nssm set $ServiceName AppRestartDelay 5000                                 | Out-Null
-
-# Log rotation -- NSSM writes stdout/stderr to files it rotates when
-# they exceed AppRotateBytes. Rotated files get .N suffixes in $LogsDir.
-$stdoutLog = Join-Path $LogsDir 'stdout.log'
-$stderrLog = Join-Path $LogsDir 'stderr.log'
-& nssm set $ServiceName AppStdout $stdoutLog                                 | Out-Null
-& nssm set $ServiceName AppStderr $stderrLog                                 | Out-Null
-& nssm set $ServiceName AppRotateFiles 1                                     | Out-Null
-& nssm set $ServiceName AppRotateBytes 10485760                              | Out-Null   # 10 MB
-& nssm set $ServiceName AppStdoutCreationDisposition 4                       | Out-Null   # OPEN_ALWAYS
-& nssm set $ServiceName AppStderrCreationDisposition 4                       | Out-Null
-
-# Service account -- LocalSystem for MVP simplicity. Windows equivalent
-# to systemd's User=ambit-agent would be an "NT SERVICE\ambit-agent"
-# virtual account, but wiring that requires SeServiceLogonRight grants
-# and per-directory ACL updates. LocalSystem is more permissive than
-# ideal; hardening to a virtual account is a Phase 2 item.
-& nssm set $ServiceName ObjectName LocalSystem                               | Out-Null
-
-Write-Info "Starting service $ServiceName..."
-Start-Service $ServiceName
-Start-Sleep -Seconds 2
-
-Write-Info "Service status:"
-Get-Service $ServiceName | Format-Table Status, Name, DisplayName -AutoSize
+# Try to start it now IF the run-as user matches the current interactive
+# session. When installer is run by (elevated) UserA for a task that
+# targets UserB, we can't start it -- UserB has to log in first.
+$CurrentUserLower = ($CurrentInteractiveUser -as [string]).ToLower()
+$RunAsUserLower   = ($RunAsUser -as [string]).ToLower()
+if ($CurrentUserLower -eq $RunAsUserLower -or $CurrentUserLower.EndsWith("\$RunAsUserLower") -or $RunAsUserLower.EndsWith("\$CurrentUserLower")) {
+    Write-Info "Starting task now (matches current session)..."
+    Start-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 3
+    $state = (Get-ScheduledTask -TaskName $TaskName).State
+    Write-Info "Task state: $state"
+} else {
+    Write-Warn (
+        "Not starting task now -- installer is running as '$CurrentInteractiveUser' but " +
+        "the task is registered for '$RunAsUser'. Log in as '$RunAsUser' to trigger the first run."
+    )
+}
 
 Write-Host ""
 Write-Host "[install] Done."
 Write-Host ""
-Write-Host "  Service status:   Get-Service $ServiceName"
-Write-Host "  Tail stdout:      Get-Content -Wait -Tail 30 '$stdoutLog'"
-Write-Host "  Tail stderr:      Get-Content -Wait -Tail 30 '$stderrLog'"
-Write-Host "  Restart:          Restart-Service $ServiceName"
-Write-Host "  Edit config:      notepad $ConfigFile  # then Restart-Service"
-Write-Host "  Reconfigure svc:  nssm edit $ServiceName"
+Write-Host "  Task status:      Get-ScheduledTask -TaskName $TaskName | Format-List State,LastRunTime,LastTaskResult"
+Write-Host "  Tail stdout:      Get-Content -Wait -Tail 30 '$(Join-Path $LogsDir 'stdout.log')'"
+Write-Host "  Tail stderr:      Get-Content -Wait -Tail 30 '$(Join-Path $LogsDir 'stderr.log')'"
+Write-Host "  Restart:          Stop-ScheduledTask -TaskName $TaskName; Start-ScheduledTask -TaskName $TaskName"
+Write-Host "  Edit config:      notepad '$ConfigFile'  # then restart"
 Write-Host ""
 Write-Host "Portal > Staff > Runtimes should show this runtime as **online**"
-Write-Host "within about 15 seconds (the heartbeat interval). If it stays"
-Write-Host "offline, check '$stderrLog' -- the most common causes are a"
-Write-Host "wrong ADMIN_URL or a token already used on another machine."
+Write-Host "within about 15 seconds after '$RunAsUser' logs in. If it stays"
+Write-Host "offline, check '$(Join-Path $LogsDir 'stderr.log')' -- the most"
+Write-Host "common causes are a wrong ADMIN_URL or a token already used on"
+Write-Host "another machine."
