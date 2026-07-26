@@ -169,8 +169,19 @@ export async function launchBrowser(
       // OUR client — it does not kill the underlying Chrome process. The
       // daemon-managed Chrome (its tabs, cookies, extensions, and the
       // customer's manual browsing) is unaffected.
+      //
+      // AMBIT_KEEP_TAB_OPEN=1 skips the `page.close()` step — the tab
+      // stays visible in the managed Chrome after the run so the
+      // customer can inspect what the agent typed. The CDP disconnect
+      // still runs (Playwright event listeners are released), so the
+      // Chrome-slowdown concern above still applies to the CLIENT side
+      // but the visible tab lingers. Recommended only during agent
+      // development / testing; leave OFF in steady-state production so
+      // tabs don't accumulate over dozens of runs.
       close: async () => {
-        try { await page.close(); } catch { /* ignore */ }
+        if (process.env.AMBIT_KEEP_TAB_OPEN !== '1') {
+          try { await page.close(); } catch { /* ignore */ }
+        }
         try { await browser.close(); } catch { /* ignore */ }
       },
     };
