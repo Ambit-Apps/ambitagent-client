@@ -163,6 +163,36 @@ function Ensure-NodeLts {
 }
 Ensure-NodeLts
 
+# --- prereq: Google Chrome -------------------------------------------
+# The daemon's ChromeManager needs REAL Google Chrome (not Playwright's
+# Chromium — different fingerprint, no Web Store extensions). Detect the
+# three standard install locations before falling back to winget; if
+# Chrome is already there we never touch it.
+function Ensure-Chrome {
+    $paths = @(
+        (Join-Path $env:ProgramFiles       'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:LOCALAPPDATA       'Google\Chrome\Application\chrome.exe')
+    )
+    foreach ($p in $paths) {
+        if ($p -and (Test-Path $p)) {
+            Write-Info "Google Chrome already installed at $p -- reusing."
+            return
+        }
+    }
+    if (-not $HasWinget) {
+        Write-Fail (
+            "Google Chrome is not installed and winget is unavailable. " +
+            "Install Chrome manually from https://www.google.com/chrome/ and re-run this script."
+        )
+    }
+    Write-Info "Installing Google Chrome via winget..."
+    & winget install --id Google.Chrome -e --silent --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Fail "winget install Chrome failed (exit $LASTEXITCODE)." }
+    Refresh-Path
+}
+Ensure-Chrome
+
 # --- dirs ------------------------------------------------------------
 Write-Info "Preparing directories under $InstallRoot and $DataDir..."
 foreach ($d in @($InstallRoot, $BrowsersDir, $DataDir, $LogsDir)) {

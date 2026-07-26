@@ -4,7 +4,12 @@
 #
 # Tears down what install.ps1 (Task Scheduler variant) sets up:
 #   - Unregisters the AmbitAgentRuntime scheduled task
+#   - Tears down the LEGACY NSSM ambit-agent service (if present)
 #   - Kills any lingering daemon node.exe
+#   - Kills any orphaned managed-Chrome processes (daemon spawns them
+#     detached, so they survive daemon death by design — must be killed
+#     explicitly here to free the debug port + release profile-dir file
+#     handles before removal)
 #   - Removes C:\Program Files\Ambit Agent (app + browsers + wrapper)
 #   - Removes C:\ProgramData\Ambit Agent (config + logs) UNLESS -KeepConfig
 #   - Optionally wipes the managed Chrome profile with -WipeChromeProfile
@@ -78,7 +83,51 @@ if ($daemonNodes) {
     Start-Sleep -Seconds 2
 }
 
-# --- 4. Remove install directory -------------------------------------
+# --- 4. Kill any managed-Chrome processes ----------------------------
+# The daemon spawns Chrome with `detached: true` + `unref()` (see
+# chrome/manager.ts), so Chrome outlives the daemon by design. Once the
+# daemon dies, that Chrome becomes an orphan — unmanaged, still holding
+# the debug port + profile dir. Any reinstall would then see the port
+# listening and try to adopt the orphaned Chrome, or fail Chrome-profile
+# removal because a helper process is holding a file handle.
+#
+# Identify OUR Chrome (not the customer's personal Chrome) by two
+# fingerprints in the command line:
+#   • `--user-data-dir=...\.ambit\chrome-profile` — set only by the daemon
+#   • `--remote-debugging-port=9222`               — set only by the daemon
+# The customer's personal Chrome has neither.
+#
+# Get-CimInstance requires Admin to see other users' CommandLine, which
+# the `#Requires -RunAsAdministrator` at the top of this file guarantees.
+$managedChromes = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine -like '*\.ambit\chrome-profile*' -or
+            $_.CommandLine -like '*remote-debugging-port=9222*'
+        )
+    }
+if ($managedChromes) {
+    Write-Info "Killing $($managedChromes.Count) managed-Chrome process(es) (main + helpers)..."
+    foreach ($p in $managedChromes) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+    # Verify: if any managed Chrome survived, warn but continue — the
+    # subsequent Remove-Item calls will fail on locked files with a
+    # non-fatal error and the verification block at the bottom will flag it.
+    $survivors = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and (
+                $_.CommandLine -like '*\.ambit\chrome-profile*' -or
+                $_.CommandLine -like '*remote-debugging-port=9222*'
+            )
+        }
+    if ($survivors) {
+        Write-Warn "$($survivors.Count) managed-Chrome process(es) survived the kill — profile-dir removal may fail."
+    }
+}
+
+# --- 5. Remove install directory -------------------------------------
 if (Test-Path $InstallRoot) {
     Write-Info "Removing $InstallRoot..."
     Remove-Item -Recurse -Force $InstallRoot -ErrorAction SilentlyContinue
@@ -89,7 +138,7 @@ if (Test-Path $InstallRoot) {
     Write-Info "No install dir at $InstallRoot -- skipping."
 }
 
-# --- 5. Remove data directory (config + logs) unless -KeepConfig -----
+# --- 6. Remove data directory (config + logs) unless -KeepConfig -----
 if ($KeepConfig) {
     Write-Info "Preserving $DataDir (--KeepConfig)."
 } elseif (Test-Path $DataDir) {
@@ -97,7 +146,7 @@ if ($KeepConfig) {
     Remove-Item -Recurse -Force $DataDir -ErrorAction SilentlyContinue
 }
 
-# --- 6. Managed Chrome profile (opt-in) ------------------------------
+# --- 7. Managed Chrome profile (opt-in) ------------------------------
 # The daemon stores its dedicated Chrome profile under the RUN-AS user's
 # home dir, NOT Program Files -- so we need the username to find it.
 # Default target: the interactive user who invoked this script. Override
@@ -121,12 +170,23 @@ if ($WipeChromeProfile) {
     Write-Info "Preserving managed Chrome profile (pass -WipeChromeProfile to remove it)."
 }
 
-# --- 7. Verify -------------------------------------------------------
+# --- 8. Verify -------------------------------------------------------
 Write-Host ""
 Write-Host "[uninstall] Verification:" -ForegroundColor Cyan
 $checks = @(
-    @{ Label = "Scheduled task '$TaskName'";       Test = { -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) } }
+    @{ Label = "Scheduled task '$TaskName'";        Test = { -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) } }
     @{ Label = "Legacy service '$LegacyServiceName'"; Test = { -not (Get-Service $LegacyServiceName -ErrorAction SilentlyContinue) } }
+    @{ Label = "Daemon node.exe";                    Test = { -not (Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallRoot\*" }) } }
+    @{ Label = "Managed Chrome";                     Test = {
+        $stillThere = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.CommandLine -and (
+                    $_.CommandLine -like '*\.ambit\chrome-profile*' -or
+                    $_.CommandLine -like '*remote-debugging-port=9222*'
+                )
+            }
+        -not $stillThere
+    } }
     @{ Label = "Install dir '$InstallRoot'";        Test = { -not (Test-Path $InstallRoot) } }
     @{ Label = "Data dir '$DataDir'";               Test = { $KeepConfig -or -not (Test-Path $DataDir) } }
 )

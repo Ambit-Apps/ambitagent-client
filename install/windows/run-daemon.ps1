@@ -66,18 +66,21 @@ if (-not (Test-Path $MainJs)) {
 
 Set-Location $AppDir
 
-# node.exe with stdout/stderr both redirected to the log files.
-# `Start-Process -Wait` blocks this wrapper until the daemon exits;
-# Task Scheduler's "Restart on failure" then re-launches this whole
-# wrapper on crash. `*>>` merges streams; we split them via -Redirect
-# args on Start-Process instead so stderr stays isolated.
+# Foreground invocation. Runs node as a direct child of THIS PowerShell
+# process, in the same session and process tree.
+#
+# Why not Start-Process -Wait: Task Scheduler's "Stop" action kills only
+# the PowerShell process it launched, not its children. Start-Process
+# spawned children survive that kill and become orphan daemons — each
+# Stop→Start cycle then leaves the old node alive alongside the new one,
+# and multiple daemons race on the same enrollment token (visible as
+# "Superseded by new connection" churn in the admin logs). Foreground `&`
+# invocation keeps node as a real child so it dies with the wrapper.
+#
+# Stream redirection: `1>>` appends stdout, `2>>` appends stderr, both
+# native PowerShell operators that work on external processes' streams.
 $node = (Get-Command node).Source
-Start-Process -FilePath $node `
-    -ArgumentList "`"$MainJs`"" `
-    -NoNewWindow `
-    -Wait `
-    -RedirectStandardOutput $StdoutLog `
-    -RedirectStandardError  $StderrLog
+& $node $MainJs 1>>$StdoutLog 2>>$StderrLog
 
 $exitCode = $LASTEXITCODE
 "$(Get-Date -Format o) [wrapper] daemon exited (code=$exitCode)" |
