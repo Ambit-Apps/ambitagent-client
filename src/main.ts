@@ -19,6 +19,21 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const log = createLogger(config.logLevel);
 
+  // A long-lived daemon must never die from a stray async error. Seen in
+  // the wild: Playwright's dialog auto-dismiss racing a beforeunload
+  // prompt in the managed Chrome ("Page.handleJavaScriptDialog: No
+  // dialog is showing") — an unhandled rejection from deep inside
+  // playwright-core that took the whole process (and its in-flight run)
+  // down. Log loudly and keep serving; per-run failures are already
+  // caught and reported through the executor's own error path.
+  process.on('unhandledRejection', (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    log.error({ err: err.message, stack: err.stack }, 'unhandled rejection (daemon continuing)');
+  });
+  process.on('uncaughtException', (err) => {
+    log.error({ err: err.message, stack: err.stack }, 'uncaught exception (daemon continuing)');
+  });
+
   log.info(
     {
       adminUrl: config.adminUrl,
