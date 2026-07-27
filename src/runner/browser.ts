@@ -92,17 +92,77 @@ export interface LaunchOptions {
    * customers running the daemon.
    */
   attachCdpUrl?: string;
+  /** Called each time the self-healing page replaces a closed tab. */
+  onPageRecreated?: () => void;
 }
 
 const missingBinary = (err: unknown): boolean =>
   /Executable doesn't exist|Please run:/.test((err as Error)?.message ?? String(err));
+
+/**
+ * Page methods that return synchronously — they can't await a heal, so
+ * they forward to the current page as-is. Everything else (goto, click,
+ * screenshot, evaluate, …) is async and gets the heal-first treatment.
+ */
+const SYNC_PAGE_METHODS = new Set([
+  'url', 'isClosed', 'viewportSize', 'video', 'frames', 'mainFrame', 'context',
+  'workers', 'locator', 'frameLocator', 'getByRole', 'getByText', 'getByLabel',
+  'getByTestId', 'getByPlaceholder', 'getByAltText', 'getByTitle',
+  'on', 'off', 'once', 'addListener', 'removeListener', 'removeAllListeners',
+  'emit', 'listenerCount', 'setDefaultTimeout', 'setDefaultNavigationTimeout',
+]);
+
+/**
+ * Wrap a Page so the run survives its tab being closed mid-flight.
+ *
+ * Approval gates leave runs paused for minutes-to-hours with an open tab
+ * parked in the customer's managed Chrome — and customers close stray
+ * tabs. Without this, the first `page.goto` after resume throws "Target
+ * page ... has been closed" and the whole run dies (observed on run 106).
+ *
+ * Every async op first checks `isClosed()` and transparently opens a
+ * replacement tab in the same context. Sync accessors (url, locator, …)
+ * forward to the current page unhealed — safe in practice because agent
+ * flows always hit an async op (goto/waitForTimeout) before sync reads
+ * after any long pause.
+ */
+function selfHealingPage(
+  context: BrowserContext,
+  initial: Page,
+  onRecreate?: () => void,
+): { proxy: Page; closeCurrent: () => Promise<void> } {
+  let current = initial;
+  const proxy = new Proxy(initial, {
+    get(_target, prop) {
+      const value = (current as unknown as Record<PropertyKey, unknown>)[prop];
+      if (typeof value !== 'function') return value;
+      const name = String(prop);
+      if (SYNC_PAGE_METHODS.has(name) || name === 'close' || typeof prop === 'symbol') {
+        return (value as (...a: unknown[]) => unknown).bind(current);
+      }
+      return async (...args: unknown[]) => {
+        if (current.isClosed()) {
+          current = await context.newPage();
+          onRecreate?.();
+        }
+        return (current as unknown as Record<string, (...a: unknown[]) => unknown>)[name](...args);
+      };
+    },
+  }) as Page;
+  return {
+    proxy,
+    closeCurrent: async () => {
+      try { if (!current.isClosed()) await current.close(); } catch { /* ignore */ }
+    },
+  };
+}
 
 const BINARY_HINT =
   'Playwright Chromium binary is missing on this runtime. ' +
   'Install it with:  npx playwright install chromium';
 
 export async function launchBrowser(
-  { headless = true, persistentProfileDir, model, attachCdpUrl }: LaunchOptions = {},
+  { headless = true, persistentProfileDir, model, attachCdpUrl, onPageRecreated }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
   // Precedence:
   //   1. If the manifest declares model='attached_chrome', use attach mode
@@ -150,9 +210,10 @@ export async function launchBrowser(
       );
     }
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    const page = await context.newPage();
+    const rawPage = await context.newPage();
+    const healed = selfHealingPage(context, rawPage, onPageRecreated);
     return {
-      page,
+      page: healed.proxy,
       context,
       browser,
       // Close our tab AND disconnect the CDP client — otherwise the
@@ -170,7 +231,7 @@ export async function launchBrowser(
       // daemon-managed Chrome (its tabs, cookies, extensions, and the
       // customer's manual browsing) is unaffected.
       close: async () => {
-        try { await page.close(); } catch { /* ignore */ }
+        await healed.closeCurrent();
         try { await browser.close(); } catch { /* ignore */ }
       },
     };
@@ -192,7 +253,7 @@ export async function launchBrowser(
     }
     const page = context.pages()[0] ?? (await context.newPage());
     return {
-      page,
+      page: selfHealingPage(context, page, onPageRecreated).proxy,
       context,
       browser: context.browser(),
       close: async () => {
@@ -220,7 +281,7 @@ export async function launchBrowser(
   const page = await context.newPage();
 
   return {
-    page,
+    page: selfHealingPage(context, page, onPageRecreated).proxy,
     context,
     browser,
     close: async () => {

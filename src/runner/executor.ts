@@ -191,7 +191,14 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
             }
           }
 
-          browser = await launchBrowser({ headless, persistentProfileDir, model, attachCdpUrl });
+          browser = await launchBrowser({
+            headless,
+            persistentProfileDir,
+            model,
+            attachCdpUrl,
+            onPageRecreated: () =>
+              log.info({ runId: msg.runId }, 'agent tab was closed — opened a replacement tab'),
+          });
         }
 
         // 5) Dynamic-import the entry.
