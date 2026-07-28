@@ -485,6 +485,25 @@ function createRuntimeCtx({
         if (!res.ok) throw new Error(`ctx.files.getFile("${key}"): admin returned ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
       },
+      // All files uploaded under one key (a `multiple: true` file input),
+      // in upload order. The first response's x-ambit-file-count header
+      // tells us how many more to fetch via ?index=N.
+      async getFiles(key: string): Promise<Uint8Array[]> {
+        const first = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        if (first.status === 404) return [];
+        if (!first.ok) throw new Error(`ctx.files.getFiles("${key}"): admin returned ${first.status}`);
+        const out = [new Uint8Array(await first.arrayBuffer())];
+        const count = Number.parseInt(first.headers.get('x-ambit-file-count') ?? '1', 10) || 1;
+        for (let i = 1; i < count; i++) {
+          const res = await adminFetch(
+            config,
+            `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}?index=${i}`,
+          );
+          if (!res.ok) break; // partial set beats a crashed run
+          out.push(new Uint8Array(await res.arrayBuffer()));
+        }
+        return out;
+      },
       async getFileMeta(key: string) {
         const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
         if (res.status === 404) return null;
