@@ -11,21 +11,30 @@ import { detectChromeBinary, chromeInstallHint } from './detect.js';
  *
  * Design decisions locked in this pass:
  *
- *   • Launch on daemon startup (not on-demand). Customer machines are
- *     typically laptops with a person present; the window being up
- *     immediately means they see it, do their one-time login + extension
- *     install, and every subsequent agent run is instant. Headless
- *     server VMs that don't need Chrome set `AMBIT_CHROME_ENABLED=false`.
+ *   • Lazy launch on first agent run (NOT at daemon startup). The
+ *     daemon sits idle at 0 Chrome-related memory until admin sends a
+ *     run_task that needs a browser. `whenReady()` triggers the launch
+ *     the first time it's called; subsequent calls hit the ready cache.
+ *     Rationale: customers hated seeing Chrome pop up at boot when they
+ *     had no intention of running an agent that hour. Trade-off is a
+ *     ~2s cold-start on the first run after login; every subsequent
+ *     run reuses the already-ready Chrome and is instant.
+ *
+ *   • User-initiated close is respected. If the customer clicks the
+ *     Chrome window's X button (clean exit, code 0), we go back to
+ *     idle — we do NOT auto-relaunch. The next agent run brings it
+ *     back. Only crashes (non-zero exit or signal death) trigger the
+ *     restart-with-backoff logic below.
  *
  *   • Dedicated user-data-dir + dedicated port. Never touches the
  *     customer's personal Chrome profile. Port collision = fail with a
  *     clear error rather than silently choosing another port and losing
  *     agents in a confusing "which Chrome are we talking to?" swamp.
  *
- *   • Auto-restart on unexpected exit, with exponential backoff (1s, 5s,
- *     30s, 2min). After 4 back-to-back restarts we stop trying and log
- *     an error — the customer probably has a reason for closing it,
- *     and we don't want to fight them.
+ *   • Auto-restart on CRASH only (not user close), with exponential
+ *     backoff (1s, 5s, 30s, 2min). After 4 back-to-back restarts we
+ *     go back to idle so the customer's next agent run gets a fresh
+ *     attempt with a fresh restart budget.
  *
  *   • Level-2 branding: after launch, we open a persistent welcome tab
  *     via CDP with `<title>Ambit Agent — Managed Chrome</title>` and a
@@ -80,16 +89,18 @@ export interface ChromeManager {
 }
 
 /**
- * No-op manager returned when Chrome management is disabled (headless
- * server VMs, or `AMBIT_ATTACH_CDP` is set — see startChromeManager()).
+ * No-op manager returned when Chrome management is disabled. Constructor
+ * takes the specific reason so `whenReady()` throws an actionable error
+ * — the old catch-all message ("AMBIT_CHROME_ENABLED=false or AMBIT_ATTACH_CDP
+ * is set") caused an hours-long debugging detour when the real reason
+ * was "Google Chrome not found" and the customer was told to check the
+ * wrong things.
  */
 class DisabledChromeManager implements ChromeManager {
+  constructor(private readonly reason: string) {}
   isReady(): boolean { return false; }
   async whenReady(): Promise<string> {
-    throw new Error(
-      'Chrome is not managed by this daemon (AMBIT_CHROME_ENABLED=false or AMBIT_ATTACH_CDP is set). ' +
-        'Nothing to wait for.',
-    );
+    throw new Error(this.reason);
   }
   currentUrl(): string | null { return null; }
   async stop(): Promise<void> { /* nothing to stop */ }
@@ -104,7 +115,10 @@ class DisabledChromeManager implements ChromeManager {
 export function startChromeManager(config: Config, log: Logger): ChromeManager {
   if (!config.chromeEnabled) {
     log.info({ reason: 'AMBIT_CHROME_ENABLED=false' }, 'Chrome management disabled');
-    return new DisabledChromeManager();
+    return new DisabledChromeManager(
+      'Chrome management is disabled by config (AMBIT_CHROME_ENABLED=false). ' +
+        'Remove that env var / config line and restart the daemon to enable managed Chrome.',
+    );
   }
   // If the operator already pointed us at a Chrome via env var, we let
   // that win. Managing a second one would just confuse things.
@@ -113,13 +127,21 @@ export function startChromeManager(config: Config, log: Logger): ChromeManager {
       { attachCdp: process.env.AMBIT_ATTACH_CDP },
       'Chrome management skipped — AMBIT_ATTACH_CDP overrides',
     );
-    return new DisabledChromeManager();
+    return new DisabledChromeManager(
+      `AMBIT_ATTACH_CDP is set (${process.env.AMBIT_ATTACH_CDP}), so the daemon defers ` +
+        'Chrome lifecycle to whatever launched the debug Chrome at that URL. ' +
+        'Verify that Chrome is actually running with --remote-debugging-port set correctly, ' +
+        'or unset AMBIT_ATTACH_CDP to let the daemon manage its own Chrome.',
+    );
   }
 
   const binary = config.chromePath || detectChromeBinary();
   if (!binary) {
     log.error({ hint: chromeInstallHint() }, 'Google Chrome not found');
-    return new DisabledChromeManager();
+    return new DisabledChromeManager(
+      'Google Chrome is not installed on this machine (checked standard install ' +
+        'locations for the current platform). ' + chromeInstallHint(),
+    );
   }
 
   return new RealChromeManager(config, log, binary);
@@ -144,7 +166,12 @@ class RealChromeManager implements ChromeManager {
     private readonly binary: string,
   ) {
     this.url = `http://localhost:${config.chromePort}`;
-    void this.start();
+    // NOTE: no `void this.start()` here. Chrome launches on first
+    // `whenReady()` call — see the lazy-launch note in the file header.
+    this.log.info(
+      { binary: this.binary, port: this.config.chromePort },
+      'Chrome manager ready — Chrome will launch on first agent run',
+    );
   }
 
   isReady(): boolean {
@@ -160,10 +187,18 @@ class RealChromeManager implements ChromeManager {
     if (this.state === 'stopped') {
       return Promise.reject(new Error('Chrome manager is stopped'));
     }
-    return new Promise((resolve, reject) => {
+    const promise = new Promise<string>((resolve, reject) => {
       this.readyResolvers.push(resolve);
       this.readyRejecters.push(reject);
     });
+    // Lazy-launch: fire start() on the FIRST call from idle. Subsequent
+    // calls while 'starting' / 'restarting' just wait for the in-flight
+    // start to reach markReady(). This is what makes the "user closes
+    // Chrome → back to idle → next agent run relaunches it" cycle work.
+    if (this.state === 'idle') {
+      void this.start();
+    }
+    return promise;
   }
 
   async stop(): Promise<void> {
@@ -281,6 +316,16 @@ class RealChromeManager implements ChromeManager {
       // doesn't see Chrome's onboarding wizard the first time we launch.
       '--no-first-run',
       '--no-default-browser-check',
+      // Force a known-good desktop viewport. Amazon Logistics (and most
+      // enterprise dashboards we automate) has a reflow at ~1200px that
+      // shifts column geometry — narrower windows put block tiles at
+      // pixel positions that our geometry-based day-column scraper
+      // misses entirely. Pin FHD here so layout is consistent across
+      // customer machines regardless of Chrome's default startup size
+      // (which varies by monitor DPI, OS, and per-profile last-window
+      // memory). Position at top-left for the same predictability.
+      '--window-size=1920,1080',
+      '--window-position=0,0',
       // Land on the welcome tab immediately — the URL argument works as
       // Chrome's "open this at startup" spot. We rewrite the tab's DOM
       // via CDP once Chrome is ready so the title reads "Ambit Agent".
@@ -335,12 +380,25 @@ class RealChromeManager implements ChromeManager {
 
     if (!isDarwin) {
       // On Linux/Windows the ChildProcess IS Chrome — wire its exit event
-      // to trigger a restart. On darwin the ChildProcess is `open` (already
-      // exiting momentarily); we ignore its exit and rely on the health
-      // check to notice Chrome dying.
+      // to distinguish user-close from crash. On darwin the ChildProcess
+      // is `open` (already exiting momentarily); we ignore its exit and
+      // rely on the health check to notice Chrome dying.
       proc.on('exit', (code, signal) => {
-        if ((this.state as State) === 'stopped') return; // clean shutdown
-        this.log.warn({ code, signal }, 'managed Chrome exited unexpectedly');
+        if ((this.state as State) === 'stopped') return; // clean shutdown from stop()
+        // User-close signature: exit code 0, no signal. Chrome exits
+        // cleanly when the last window closes. Respect that — do NOT
+        // auto-relaunch; the next agent run's whenReady() will trigger
+        // a fresh start from idle.
+        if (code === 0 && !signal) {
+          this.log.info(
+            { code, signal },
+            'managed Chrome exited cleanly (user closed the window) — going idle; next agent run will relaunch',
+          );
+          this.goIdle();
+          return;
+        }
+        // Anything else = crash. Trigger the exponential-backoff restart.
+        this.log.warn({ code, signal }, 'managed Chrome crashed');
         this.state = 'restarting';
         this.scheduleRestart();
       });
@@ -399,25 +457,50 @@ class RealChromeManager implements ChromeManager {
       this.log.warn({ url: this.url }, 'managed Chrome health check failed');
       if (process.platform === 'darwin') {
         // On macOS we don't hold a live ChildProcess for Chrome (it was
-        // launched via `open`, whose process has long since exited).
-        // Schedule the restart directly — the exit-handler pathway that
-        // Linux/Windows use isn't available here.
-        this.state = 'restarting';
-        this.scheduleRestart();
+        // launched via `open`, whose process has long since exited), so
+        // we can't distinguish user-close from crash via an exit code.
+        // Default to user-close semantics: go idle, wait for the next
+        // agent run to relaunch. If it was really a crash, the customer
+        // barely notices — their next Run relaunches Chrome anyway.
+        // Small trade-off (no auto-recovery on crash for Mac) in exchange
+        // for consistent Q1=A/Q2=A behavior across platforms.
+        this.log.info('Chrome disappeared on darwin — treating as user-close, going idle');
+        this.goIdle();
       } else {
-        // On other platforms: kill our ChildProcess (which IS Chrome) so
-        // its exit handler fires and drives the restart. Single entry
-        // point avoids double-firing scheduleRestart.
+        // Linux/Windows: kill our ChildProcess so its exit handler fires
+        // and classifies as user-close vs crash based on exit code.
+        // Single entry point avoids double-firing scheduleRestart.
         const p = this.process;
         if (p && !p.killed) {
           try { p.kill('SIGKILL'); } catch { /* ignore */ }
         } else if (!p) {
-          // No process but state says ready — inconsistent, force-restart.
-          this.state = 'restarting';
-          this.scheduleRestart();
+          // No process but state says ready — inconsistent. Force-idle
+          // rather than restart; user-facing behavior stays predictable.
+          this.log.warn('health check failed but no ChildProcess to signal — going idle');
+          this.goIdle();
         }
       }
     }
+  }
+
+  /**
+   * Reset to idle state — Chrome is not running, but the manager is
+   * healthy and ready to launch again on the next `whenReady()` call.
+   * Called from three paths: normal user-close (exit code 0), macOS
+   * health-check failure (can't distinguish user-close from crash),
+   * and the fall-through after exhausting crash-restart attempts.
+   */
+  private goIdle(): void {
+    this.state = 'idle';
+    this.restartAttempt = 0;
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+    this.process = null;
+    // Pending whenReady() promises (if any) should NOT be rejected here
+    // — they'll be resolved when the next start() completes. Only reject
+    // on explicit stop() or crash-restart-exhausted paths.
   }
 
   private scheduleRestart(): void {
@@ -426,11 +509,14 @@ class RealChromeManager implements ChromeManager {
       this.log.error(
         { attempts: this.restartAttempt },
         'managed Chrome failed too many times consecutively — giving up. ' +
-          'Restart the daemon to try again, or check for another Chrome using port ' +
-          `${this.config.chromePort}.`,
+          'Going back to idle; the next agent run will try again with a fresh restart budget. ' +
+          `If this keeps happening, check for another Chrome using port ${this.config.chromePort}.`,
       );
-      this.state = 'idle';
-      this.rejectPending(new Error('managed Chrome failed to stay running'));
+      this.rejectPending(new Error(
+        `Managed Chrome crashed ${this.restartAttempt} times in a row. Going idle. ` +
+          `Next agent run will retry. If the pattern repeats, check port ${this.config.chromePort} for conflicts.`,
+      ));
+      this.goIdle();
       return;
     }
     const delay = BACKOFF_MS[this.restartAttempt];
