@@ -243,9 +243,12 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           payload: { message: e.message, stack: e.stack },
         });
       } finally {
-        // AMBIT_KEEP_OPEN=1 leaves the browser up after the run (useful when
-        // attached to a real Chrome so the operator can inspect the result).
-        if (browser && process.env.AMBIT_KEEP_OPEN !== '1') {
+        // The browser STAYS OPEN after a run by default — the customer
+        // should land on their Vendoo inventory with the new items, not
+        // watch the window vanish (and no one sets AMBIT_KEEP_OPEN on a
+        // customer machine). AMBIT_CLOSE_AFTER_RUN=1 restores the old
+        // close-on-finish behavior for headless/CI use.
+        if (browser && process.env.AMBIT_CLOSE_AFTER_RUN === '1') {
           try { await browser.close(); } catch { /* ignore */ }
         }
         try {
