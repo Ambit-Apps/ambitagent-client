@@ -94,6 +94,14 @@ export interface LaunchOptions {
   attachCdpUrl?: string;
   /** Called each time the self-healing page replaces a closed tab. */
   onPageRecreated?: () => void;
+  /**
+   * Run's abort signal. When aborted, the self-healing page proxy
+   * refuses to re-open replacement tabs and throws on any async op —
+   * kills the "close tab → self-heal reopens → agent's retry loop
+   * hammers Chrome forever" pattern seen when scripts don't propagate
+   * cancellation.
+   */
+  signal?: AbortSignal;
 }
 
 const missingBinary = (err: unknown): boolean =>
@@ -130,6 +138,7 @@ function selfHealingPage(
   context: BrowserContext,
   initial: Page,
   onRecreate?: () => void,
+  signal?: AbortSignal,
 ): { proxy: Page; closeCurrent: () => Promise<void> } {
   let current = initial;
   const proxy = new Proxy(initial, {
@@ -141,6 +150,16 @@ function selfHealingPage(
         return (value as (...a: unknown[]) => unknown).bind(current);
       }
       return async (...args: unknown[]) => {
+        // Post-cancel: refuse to keep the run alive. Without this,
+        // browser.close() from the abort listener closes the tab, then
+        // the next agent-code retry hits self-heal → context.newPage()
+        // → throws → agent catches → retries → tight loop hammering
+        // Chrome (and, until Fix B lands on admin, hammering admin
+        // too). Throwing signal.reason gives the agent a coherent
+        // CancelledError to catch (or propagate).
+        if (signal?.aborted) {
+          throw signal.reason ?? new Error('page unavailable — run cancelled');
+        }
         if (current.isClosed()) {
           current = await context.newPage();
           onRecreate?.();
@@ -162,7 +181,7 @@ const BINARY_HINT =
   'Install it with:  npx playwright install chromium';
 
 export async function launchBrowser(
-  { headless = true, persistentProfileDir, model, attachCdpUrl, onPageRecreated }: LaunchOptions = {},
+  { headless = true, persistentProfileDir, model, attachCdpUrl, onPageRecreated, signal }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
   // Precedence:
   //   1. If the manifest declares model='attached_chrome', use attach mode
@@ -211,7 +230,7 @@ export async function launchBrowser(
     }
     const context = browser.contexts()[0] ?? (await browser.newContext());
     const rawPage = await context.newPage();
-    const healed = selfHealingPage(context, rawPage, onPageRecreated);
+    const healed = selfHealingPage(context, rawPage, onPageRecreated, signal);
     return {
       page: healed.proxy,
       context,
@@ -266,7 +285,7 @@ export async function launchBrowser(
     }
     const page = context.pages()[0] ?? (await context.newPage());
     return {
-      page: selfHealingPage(context, page, onPageRecreated).proxy,
+      page: selfHealingPage(context, page, onPageRecreated, signal).proxy,
       context,
       browser: context.browser(),
       close: async () => {
