@@ -434,6 +434,17 @@ function createRuntimeCtx({
         maxTokens?: number;
         temperature?: number;
         model?: string;
+        /**
+         * Cost-attribution label — `identify`, `draft`, `category`,
+         * `list`, `recovery`. Passed straight through to the admin,
+         * which writes it onto the per-call `ai_call` usage event.
+         * Without it, cost can only be measured per run, which can't
+         * tell you which stage to optimize. Unlabelled calls roll up
+         * as `unattributed`.
+         */
+        stage?: string;
+        /** 1-based attempt number; >1 marks a retry. */
+        attempt?: number;
       }): Promise<string> {
         if (!opts || !Array.isArray(opts.messages) || opts.messages.length === 0) {
           throw new Error('ctx.ai.complete: opts.messages is required and non-empty');
@@ -454,6 +465,8 @@ function createRuntimeCtx({
               maxTokens:   opts.maxTokens,
               temperature: opts.temperature,
               model:       opts.model,
+              stage:       opts.stage,
+              attempt:     opts.attempt,
             }),
           });
         } catch (err) {
