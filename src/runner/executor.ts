@@ -646,7 +646,14 @@ function createRuntimeCtx({
     uploadScreenshot: page
       ? async (buf: Uint8Array, label: string): Promise<string> => {
           const safeLabel = String(label ?? 'screenshot').replace(/[^a-z0-9_-]+/gi, '-');
-          return uploadArtifact(buf, `${safeLabel}.png`, 'image/png', safeLabel);
+          // Detect the format from the bytes rather than assuming PNG.
+          // Agents may screenshot as JPEG (much smaller — artifacts are
+          // stored base64 in MySQL), and hardcoding image/png would serve
+          // JPEG data under a .png name with the wrong content-type.
+          const isJpeg = buf.length > 2 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+          const ext = isJpeg ? 'jpg' : 'png';
+          const mime = isJpeg ? 'image/jpeg' : 'image/png';
+          return uploadArtifact(buf, `${safeLabel}.${ext}`, mime, safeLabel);
         }
       : undefined,
   };
