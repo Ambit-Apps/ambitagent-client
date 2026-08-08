@@ -541,6 +541,17 @@ function createRuntimeCtx({
         maxTokens?: number;
         temperature?: number;
         model?: string;
+        /**
+         * Cost-attribution label — `identify`, `draft`, `category`,
+         * `list`, `recovery`. Passed straight through to the admin,
+         * which writes it onto the per-call `ai_call` usage event.
+         * Without it, cost can only be measured per run, which can't
+         * tell you which stage to optimize. Unlabelled calls roll up
+         * as `unattributed`.
+         */
+        stage?: string;
+        /** 1-based attempt number; >1 marks a retry. */
+        attempt?: number;
       }): Promise<string> {
         if (!opts || !Array.isArray(opts.messages) || opts.messages.length === 0) {
           throw new Error('ctx.ai.complete: opts.messages is required and non-empty');
@@ -561,6 +572,8 @@ function createRuntimeCtx({
               maxTokens:   opts.maxTokens,
               temperature: opts.temperature,
               model:       opts.model,
+              stage:       opts.stage,
+              attempt:     opts.attempt,
             }),
             signal,
           });
@@ -746,7 +759,14 @@ function createRuntimeCtx({
     uploadScreenshot: page
       ? async (buf: Uint8Array, label: string): Promise<string> => {
           const safeLabel = String(label ?? 'screenshot').replace(/[^a-z0-9_-]+/gi, '-');
-          return uploadArtifact(buf, `${safeLabel}.png`, 'image/png', safeLabel);
+          // Detect the format from the bytes rather than assuming PNG.
+          // Agents may screenshot as JPEG (much smaller — artifacts are
+          // stored base64 in MySQL), and hardcoding image/png would serve
+          // JPEG data under a .png name with the wrong content-type.
+          const isJpeg = buf.length > 2 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+          const ext = isJpeg ? 'jpg' : 'png';
+          const mime = isJpeg ? 'image/jpeg' : 'image/png';
+          return uploadArtifact(buf, `${safeLabel}.${ext}`, mime, safeLabel);
         }
       : undefined,
   };
