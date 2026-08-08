@@ -2,7 +2,7 @@
 import { loadConfig } from './config.js';
 import { createLogger } from './log.js';
 import { createConnection } from './ws/connection.js';
-import { createRealExecutor } from './runner/executor.js';
+import { createRealExecutor, CancelledError } from './runner/executor.js';
 import { startChromeManager } from './chrome/manager.js';
 import type { AdminToRuntime } from './protocol/ws.js';
 
@@ -59,15 +59,24 @@ async function main(): Promise<void> {
     chrome,
   });
 
+  // Live cancellation registry — one AbortController per in-flight run.
+  // main.ts owns this because cancel messages arrive at the WS layer,
+  // not inside the executor. Registered on run_task, aborted on cancel,
+  // deleted in the executor's finally so late cancels for finished runs
+  // are safely ignored (map miss = "run already gone").
+  const activeRuns = new Map<string, AbortController>();
+
   conn.on('message', (msg: AdminToRuntime) => {
     switch (msg.type) {
-      case 'run_task':
+      case 'run_task': {
         // Fire and forget — the executor emits events back via
         // conn.send(). Failures inside the executor are caught here
         // and surfaced as an `error` event so the admin doesn't have
         // an orphan `dispatched` run.
+        const ac = new AbortController();
+        activeRuns.set(msg.runId, ac);
         executor
-          .runTask(msg, (event) => conn.send(event))
+          .runTask(msg, (event) => conn.send(event), ac.signal)
           .catch((err: Error) => {
             log.error({ runId: msg.runId, err: err.message }, 'executor threw');
             conn.send({
@@ -77,11 +86,25 @@ async function main(): Promise<void> {
               ts: Date.now(),
               payload: { message: err.message, stack: err.stack },
             });
+          })
+          .finally(() => {
+            activeRuns.delete(msg.runId);
           });
         return;
-      case 'cancel':
-        log.info({ runId: msg.runId }, 'cancel received (cancellation not wired yet)');
+      }
+      case 'cancel': {
+        const ac = activeRuns.get(msg.runId);
+        if (!ac) {
+          // Common: cancel arrives after the run finished on its own
+          // (or was never received here). No-op, no error — admin's
+          // authoritative status is already `cancelled`/`failed`.
+          log.info({ runId: msg.runId }, 'cancel: run not active — ignoring');
+          return;
+        }
+        log.info({ runId: msg.runId }, 'cancel received — aborting run');
+        ac.abort(new CancelledError('cancelled by admin'));
         return;
+      }
       case 'update_now':
         log.info({ releaseId: msg.releaseId }, 'update_now received (updater not wired yet)');
         return;

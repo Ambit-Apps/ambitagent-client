@@ -38,7 +38,26 @@ import { launchBrowser } from './browser.js';
 register();
 
 export interface Executor {
-  runTask(msg: RunTaskMessage, emit: (event: RunEventMessage) => void): Promise<void>;
+  runTask(
+    msg: RunTaskMessage,
+    emit: (event: RunEventMessage) => void,
+    signal?: AbortSignal,
+  ): Promise<void>;
+}
+
+/**
+ * Thrown when a run is cancelled by admin via the WS `cancel` message.
+ * The executor's catch block recognizes this and emits a `log` event
+ * (not `error`) so admin's `statusFromKind('error')` doesn't try to
+ * flip the run from cancelled → failed. Belt-and-suspenders: admin
+ * also drops events for terminal runs, but keeping the local emission
+ * quiet means fewer stray events in the first place.
+ */
+export class CancelledError extends Error {
+  constructor(message = 'cancelled') {
+    super(message);
+    this.name = 'CancelledError';
+  }
 }
 
 import type { ChromeManager } from '../chrome/manager.js';
@@ -62,11 +81,16 @@ const nowTs = () => Date.now();
 
 export function createRealExecutor(log: Logger, config: ExecutorConfig): Executor {
   return {
-    async runTask(msg, emit) {
+    async runTask(msg, emit, signal) {
       log.info(
         { runId: msg.runId, taskDefinitionId: msg.taskDefinitionId, fileCount: msg.files.length },
         'executor: picked up run',
       );
+
+      // If cancel arrived before we even started, bail immediately.
+      if (signal?.aborted) {
+        throw signal.reason ?? new CancelledError('cancelled before start');
+      }
 
       emit({
         type: 'run_event',
@@ -198,7 +222,22 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
             attachCdpUrl,
             onPageRecreated: () =>
               log.info({ runId: msg.runId }, 'agent tab was closed — opened a replacement tab'),
+            signal,
           });
+
+          // Cancel → close the browser now. Any in-flight Playwright op
+          // (goto, click, waitFor…) rejects with "Target has been closed",
+          // which the script's own try/catch surfaces up to our catch
+          // below. Fail-the-run semantics: no graceful teardown attempt.
+          if (signal && browser) {
+            const b = browser;
+            const onAbort = () => {
+              log.info({ runId: msg.runId }, 'cancel: closing browser handle');
+              b.close().catch(() => { /* already closing */ });
+            };
+            if (signal.aborted) onAbort();
+            else signal.addEventListener('abort', onAbort, { once: true });
+          }
         }
 
         // 5) Dynamic-import the entry.
@@ -218,12 +257,40 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           emit,
           log,
           config,
+          signal,
         });
 
-        const result = await (mod.run as (i: unknown, c: unknown) => Promise<unknown>)(
+        // Promise.race the script against the abort signal. The script
+        // won't necessarily notice cancel on its own — it may be stuck
+        // in `ctx.products.lookupByImage` (Claude Vision, 30-90s), a
+        // Playwright `page.waitForTimeout`, or its own retry loop that
+        // swallows "Target closed". The race guarantees we return from
+        // runTask within milliseconds of cancel regardless of what the
+        // script is doing. The orphaned script promise keeps running
+        // in the background — that's fine: its browser is already
+        // closed, and its ctx.log calls hit admin's terminal-run guard
+        // and get dropped.
+        const runScript = (mod.run as (i: unknown, c: unknown) => Promise<unknown>)(
           msg.inputs ?? {},
           ctx,
         );
+        const abortRejection = new Promise<never>((_, reject) => {
+          if (!signal) return; // never resolves — race collapses to script
+          if (signal.aborted) {
+            reject(signal.reason ?? new CancelledError('cancelled during run'));
+            return;
+          }
+          signal.addEventListener(
+            'abort',
+            () => reject(signal.reason ?? new CancelledError('cancelled during run')),
+            { once: true },
+          );
+        });
+        const result = await Promise.race([runScript, abortRejection]);
+        // Attach a swallow handler to the orphaned script — Node yells about
+        // unhandled rejections if the script eventually rejects after we've
+        // already returned via the race.
+        runScript.catch(() => { /* orphaned, handled via race */ });
 
         emit({
           type: 'run_event',
@@ -234,21 +301,46 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
         });
       } catch (err) {
         const e = err as Error;
-        log.error({ runId: msg.runId, err: e.message, stack: e.stack }, 'run failed');
-        emit({
-          type: 'run_event',
-          runId: msg.runId,
-          kind: 'error',
-          ts: nowTs(),
-          payload: { message: e.message, stack: e.stack },
-        });
+        // Cancel path: admin already flipped the run to `cancelled` (or
+        // `failed` on approval-scope='run' cancel). Emit a `log` — NOT
+        // an `error` — so admin's statusFromKind doesn't try to write
+        // failed over cancelled. Admin's terminal-run short-circuit
+        // (Fix B) will drop this event anyway; the log kind is
+        // belt-and-suspenders for the tiny window before it lands.
+        const wasCancelled =
+          e instanceof CancelledError || signal?.aborted === true;
+        if (wasCancelled) {
+          log.info({ runId: msg.runId }, 'run cancelled — teardown complete');
+          emit({
+            type: 'run_event',
+            runId: msg.runId,
+            kind: 'log',
+            ts: nowTs(),
+            payload: { message: 'run cancelled by admin' },
+          });
+        } else {
+          log.error({ runId: msg.runId, err: e.message, stack: e.stack }, 'run failed');
+          emit({
+            type: 'run_event',
+            runId: msg.runId,
+            kind: 'error',
+            ts: nowTs(),
+            payload: { message: e.message, stack: e.stack },
+          });
+        }
       } finally {
-        // The browser STAYS OPEN after a run by default — the customer
-        // should land on their Vendoo inventory with the new items, not
-        // watch the window vanish (and no one sets AMBIT_KEEP_OPEN on a
-        // customer machine). AMBIT_CLOSE_AFTER_RUN=1 restores the old
-        // close-on-finish behavior for headless/CI use.
-        if (browser && process.env.AMBIT_CLOSE_AFTER_RUN === '1') {
+        // Cancelled runs ALWAYS close the browser (regardless of
+        // AMBIT_CLOSE_AFTER_RUN) — the abort listener above already
+        // fired it, but calling close() twice is harmless and covers
+        // the pre-launch cancel path.
+        //
+        // For non-cancelled runs the browser STAYS OPEN by default —
+        // the customer should land on their Vendoo inventory with the
+        // new items, not watch the window vanish. AMBIT_CLOSE_AFTER_RUN=1
+        // restores the old close-on-finish behavior for headless/CI use.
+        const closeBrowser =
+          signal?.aborted === true || process.env.AMBIT_CLOSE_AFTER_RUN === '1';
+        if (browser && closeBrowser) {
           try { await browser.close(); } catch { /* ignore */ }
         }
         try {
@@ -271,9 +363,10 @@ function createRuntimeCtx({
   inputs,
   credentials,
   page,
-  emit,
+  emit: rawEmit,
   log,
   config,
+  signal,
 }: {
   runId: string;
   inputs: unknown;
@@ -282,7 +375,20 @@ function createRuntimeCtx({
   emit: (event: RunEventMessage) => void;
   log: Logger;
   config: ExecutorConfig;
+  signal?: AbortSignal;
 }) {
+  // Post-cancel: silently drop event emissions. The executor has
+  // already returned via Promise.race, so admin's terminal-run guard
+  // would drop these anyway. Neutering here skips the message-building
+  // and WS-send cost, so an orphaned script stuck in a tight retry
+  // loop (see run 169's 4000/sec ctx.log burst) becomes cheap — no
+  // network, no memory pressure, just try/catch overhead.
+  const emit: (event: RunEventMessage) => void = signal
+    ? (event) => {
+        if (signal.aborted) return;
+        rawEmit(event);
+      }
+    : rawEmit;
   const uploadArtifact = (buf: Uint8Array, name: string, mimeType: string, label?: string) => {
     const b64 = Buffer.from(buf).toString('base64');
     emit({
@@ -384,6 +490,7 @@ function createRuntimeCtx({
               input_key: inputKey,
               options: options ?? {},
             }),
+            signal,
           });
         } catch (err) {
           throw new Error(
@@ -455,6 +562,7 @@ function createRuntimeCtx({
               temperature: opts.temperature,
               model:       opts.model,
             }),
+            signal,
           });
         } catch (err) {
           throw new Error(`ctx.ai.complete: request to ${url} failed: ${(err as Error).message}`);
@@ -483,7 +591,7 @@ function createRuntimeCtx({
     // enrollment-token-authed `/rest/runs/:runId/input-files/:key`.
     files: {
       async getFile(key: string): Promise<Uint8Array | null> {
-        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`, { signal });
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`ctx.files.getFile("${key}"): admin returned ${res.status}`);
         return new Uint8Array(await res.arrayBuffer());
@@ -492,7 +600,7 @@ function createRuntimeCtx({
       // in upload order. The first response's x-ambit-file-count header
       // tells us how many more to fetch via ?index=N.
       async getFiles(key: string): Promise<Uint8Array[]> {
-        const first = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        const first = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`, { signal });
         if (first.status === 404) return [];
         if (!first.ok) throw new Error(`ctx.files.getFiles("${key}"): admin returned ${first.status}`);
         const out = [new Uint8Array(await first.arrayBuffer())];
@@ -501,6 +609,7 @@ function createRuntimeCtx({
           const res = await adminFetch(
             config,
             `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}?index=${i}`,
+            { signal },
           );
           if (!res.ok) break; // partial set beats a crashed run
           out.push(new Uint8Array(await res.arrayBuffer()));
@@ -508,7 +617,7 @@ function createRuntimeCtx({
         return out;
       },
       async getFileMeta(key: string) {
-        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`);
+        const res = await adminFetch(config, `/rest/runs/${runId}/input-files/${encodeURIComponent(key)}`, { signal });
         if (res.status === 404) return null;
         if (!res.ok) throw new Error(`ctx.files.getFileMeta("${key}"): admin returned ${res.status}`);
         const buf = await res.arrayBuffer();
@@ -570,6 +679,7 @@ function createRuntimeCtx({
               ? new Date(Date.now() + spec.timeoutMs).toISOString()
               : undefined,
         },
+        signal,
       });
       if (!createRes.ok) {
         const body = await createRes.text().catch(() => '');
@@ -607,10 +717,13 @@ function createRuntimeCtx({
       // transition; we don't need our own client-side timeout in the loop.
       const POLL_MS = 2_000;
       for (;;) {
+        if (signal?.aborted) throw signal.reason ?? new CancelledError();
         await new Promise((r) => setTimeout(r, POLL_MS));
+        if (signal?.aborted) throw signal.reason ?? new CancelledError();
         const pollRes = await adminFetch(
           config,
           `/rest/run-approvals/runtime/${approvalId}`,
+          { signal },
         );
         if (!pollRes.ok) {
           // Transient network / admin restart — log and keep polling.
@@ -682,11 +795,14 @@ function profileNameFor(msg: RunTaskMessage): string {
   return (m?.[1] ?? 'default').toLowerCase();
 }
 
-/** Authed fetch to the admin, carrying the runtime enrollment token. */
+/** Authed fetch to the admin, carrying the runtime enrollment token.
+ *  Accepts an optional AbortSignal so callers plumb the run's cancel
+ *  signal through — a long AI/products request that started before
+ *  cancel aborts immediately instead of hanging until admin responds. */
 async function adminFetch(
   config: ExecutorConfig,
   path: string,
-  opts?: { method?: string; body?: unknown },
+  opts?: { method?: string; body?: unknown; signal?: AbortSignal },
 ): Promise<Response> {
   const url = `${config.adminUrl.replace(/\/$/, '')}${path}`;
   return fetch(url, {
@@ -696,6 +812,7 @@ async function adminFetch(
       ...(opts?.body !== undefined ? { 'content-type': 'application/json' } : {}),
     },
     body: opts?.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    signal: opts?.signal,
   });
 }
 
