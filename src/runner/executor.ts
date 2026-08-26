@@ -471,6 +471,20 @@ function createRuntimeCtx({
           minMatches?: number;
           maxMatches?: number;
           categoryHint?: string;
+          /**
+           * Identify from only SOME of the photos at `inputKey`, by 0-based
+           * upload index, in the order given — index 0 becomes the lead
+           * photo. Omit to use all of them.
+           *
+           * An input key used to mean an item. It stops meaning one when a
+           * seller drops every photo of every item into a single input and
+           * the agent works out the grouping itself, so the agent has to be
+           * able to say which photos are which item.
+           *
+           * Forwarded verbatim like the rest of `options`; the admin does
+           * the selecting, because it is the only side that holds the bytes.
+           */
+          photoIndexes?: number[];
         },
       ): Promise<unknown> {
         if (typeof inputKey !== 'string' || inputKey.length === 0) {
