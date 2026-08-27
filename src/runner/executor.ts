@@ -550,6 +550,20 @@ function createRuntimeCtx({
                       data: string;
                     };
                   }
+                | {
+                    type: 'image';
+                    /**
+                     * A photo already uploaded with this run, named rather
+                     * than inlined. The admin holds the bytes — it stored
+                     * them before this run started — so sending them back
+                     * up base64-encoded is ~130 MB of upload, for a pile of
+                     * seventeen, to tell it something it already knows.
+                     *
+                     * Forwarded verbatim like every other block; the proxy
+                     * resolves and normalizes it.
+                     */
+                    source: { type: 'run_file'; inputKey: string; index?: number };
+                  }
               >;
         }>;
         maxTokens?: number;
