@@ -525,13 +525,60 @@ class RealChromeManager implements ChromeManager {
     setTimeout(() => void this.start(), delay);
   }
 
+  /**
+   * Is there a Chrome on our port we can actually DRIVE?
+   *
+   * ── WHY AN HTTP 200 IS NOT AN ANSWER ──
+   * This used to be `res.ok` on /json/version, and a wedged Chrome
+   * answers that endpoint perfectly. Run 237 and 238 both adopted a
+   * browser whose HTTP was healthy and whose CDP session was not: the
+   * WebSocket connected, Playwright then hung for its full 30s, and the
+   * run died pointing at the daemon — which was fine.
+   *
+   * So the check now opens a real CDP session and asks the browser
+   * something. `Target.getTargets` is cheap, browser-level, and needs a
+   * live message loop to answer, which is the thing that was missing.
+   *
+   * Deliberately NOT a Playwright `connectOverCDP` probe: closing that
+   * handle closes the browser, and killing a Chrome the operator started
+   * themselves is not this function's business.
+   */
   private async pingCdp(): Promise<boolean> {
+    let wsUrl: string;
     try {
       const res = await fetch(`${this.url}${CDP_HEALTH_PATH}`);
-      return res.ok;
+      if (!res.ok) return false;
+      const body = (await res.json()) as { webSocketDebuggerUrl?: string };
+      if (!body.webSocketDebuggerUrl) return false;
+      wsUrl = body.webSocketDebuggerUrl;
     } catch {
       return false;
     }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let sock: WebSocket | null = null;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { sock?.close(); } catch { /* already gone */ }
+        resolve(ok);
+      };
+      // Short: a healthy browser answers in milliseconds, and a slow
+      // "yes" is not worth waiting for when the alternative is a run
+      // that fails half a minute later.
+      const timer = setTimeout(() => finish(false), 5_000);
+      try {
+        sock = new WebSocket(wsUrl);
+        sock.onopen = () => sock?.send(JSON.stringify({ id: 1, method: 'Target.getTargets' }));
+        sock.onmessage = () => finish(true);
+        sock.onerror = () => finish(false);
+        sock.onclose = () => finish(false);
+      } catch {
+        finish(false);
+      }
+    });
   }
 
   /**
