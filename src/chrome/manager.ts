@@ -1,5 +1,6 @@
 import { exec, spawn, type ChildProcess } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
+import { WebSocket } from 'ws';
 import type { Logger } from '../log.js';
 import type { Config } from '../config.js';
 import { detectChromeBinary, chromeInstallHint } from './detect.js';
