@@ -15,11 +15,12 @@
 #   install/dist/ambitagent-client-<YYYYMMDD-HHMMSS>-<sha>.zip
 #
 # Ship to a customer:
-#   1. Copy the .zip AND install/windows/install.ps1 AND
-#      install/windows/run-daemon.ps1 into your email.
+#   1. Copy the .zip AND install/windows/install.bat AND
+#      install/windows/install.ps1 AND install/windows/run-daemon.ps1
+#      into your email.
 #   2. Include the enrollment token + prod admin URL in the email body.
-#   3. Customer saves all three attachments into their Downloads folder,
-#      right-clicks install.ps1 → Run with PowerShell (as Administrator).
+#   3. Customer saves all four attachments into their Downloads folder,
+#      then double-clicks install.bat (self-elevates, no PowerShell needed).
 
 set -euo pipefail
 
@@ -106,13 +107,14 @@ SIZE=$(du -h "$OUT_PATH" | awk '{print $1}')
 echo ""
 echo "Built:  $OUT_PATH  ($SIZE)"
 echo ""
-echo "Send these three attachments to the customer:"
+echo "Send these four attachments to the customer:"
 echo "  1. $OUT_PATH"
-echo "  2. install/windows/install.ps1"
-echo "  3. install/windows/run-daemon.ps1"
+echo "  2. install/windows/install.bat"
+echo "  3. install/windows/install.ps1"
+echo "  4. install/windows/run-daemon.ps1"
 echo ""
 echo "Also include in the email body:"
 echo "  - Enrollment token (from portal /staff/runtimes → + Enroll runtime)"
 echo "  - Your prod ADMIN_URL (Heroku app URL)"
-echo "  - Instructions: 'save all three files into Downloads, right-click"
-echo "    install.ps1 → Run with PowerShell (as Administrator)'"
+echo "  - Instructions: 'save all four files into the same folder, then"
+echo "    double-click install.bat and click Yes on the prompts'"
