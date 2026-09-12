@@ -327,11 +327,22 @@ class RealChromeManager implements ChromeManager {
       // memory). Position at top-left for the same predictability.
       '--window-size=1920,1080',
       '--window-position=0,0',
-      // Land on the welcome tab immediately — the URL argument works as
-      // Chrome's "open this at startup" spot. We rewrite the tab's DOM
-      // via CDP once Chrome is ready so the title reads "Ambit Agent".
-      'about:blank',
     ];
+
+    // Optionally force software rendering. On machines whose GPU driver
+    // kills the renderer on device-loss (see Config.chromeDisableGpu),
+    // this trades paint speed for stability — no hardware D3D path means
+    // no `exit_on_context_lost` GPU-process death mid-run. Added before
+    // the startup URL so the positional `about:blank` stays last.
+    if (this.config.chromeDisableGpu) {
+      args.push('--disable-gpu');
+      this.log.info('managed Chrome launching with --disable-gpu (software rendering)');
+    }
+
+    // Land on the welcome tab immediately — the URL argument works as
+    // Chrome's "open this at startup" spot. We rewrite the tab's DOM
+    // via CDP once Chrome is ready so the title reads "Ambit Agent".
+    args.push('about:blank');
 
     let proc: ChildProcess;
     const isDarwin = process.platform === 'darwin';

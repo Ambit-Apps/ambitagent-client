@@ -15,6 +15,39 @@
 $ErrorActionPreference = 'Continue'   # keep going through non-fatal errors
 Set-StrictMode -Version 3.0
 
+# --- hide the console window -----------------------------------------
+# The Scheduled Task action already passes `-WindowStyle Hidden`, but that
+# flag is unreliable for logon-triggered *interactive* tasks: Windows
+# creates the console before PowerShell can apply the style, so a black
+# command window flashes — or stays visible for a long-running daemon like
+# this one. If the operator closes that window, it kills PowerShell and
+# the node daemon underneath it (the runtime drops offline).
+#
+# The definitive fix is to hide the actual console window handle at
+# runtime, here, BEFORE we launch node. GetConsoleWindow() returns this
+# process's console; SW_HIDE (0) removes it from the screen and taskbar so
+# there's nothing to accidentally close. node inherits the same (hidden)
+# console, and all its output is redirected to the log files below, so
+# nothing is lost. This does NOT hide the managed Chrome window — Chrome
+# is a separate GUI process the daemon spawns, and the human still sees it
+# for Amazon login. Keeping node a direct child of this PowerShell (see the
+# foreground `&` launch below) means Task Scheduler's Stop still tears the
+# whole tree down cleanly; we only hid the window, not changed the tree.
+try {
+    $hideSig = @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]   public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@
+    $win = Add-Type -MemberDefinition $hideSig -Name 'AmbitWin' -Namespace 'AmbitConsole' -PassThru
+    $consoleHandle = $win::GetConsoleWindow()
+    if ($consoleHandle -ne [System.IntPtr]::Zero) {
+        $win::ShowWindow($consoleHandle, 0) | Out-Null   # 0 = SW_HIDE
+    }
+} catch {
+    # Non-fatal: worst case the window stays visible (old behavior). The
+    # daemon still runs. Never let a hide failure stop the runtime.
+}
+
 $AppDir     = 'C:\Program Files\Ambit Agent\app'
 $ConfigFile = 'C:\ProgramData\Ambit Agent\config'
 $LogsDir    = 'C:\ProgramData\Ambit Agent\logs'
