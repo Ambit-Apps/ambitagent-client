@@ -21,7 +21,6 @@ Set-StrictMode -Version 3.0
 # forces the CLASSIC console host instead of Windows Terminal. This matters
 # for TWO reasons that we learned the hard way:
 #
-# runtime, here, BEFORE we launch node. GetConsoleWindow() returns this
 #   1. Hiding: Windows Terminal ignores -WindowStyle Hidden and cannot be
 #      hidden from inside the process (its window belongs to a separate
 #      windowsterminal.exe). conhost honors -WindowStyle Hidden, and the
