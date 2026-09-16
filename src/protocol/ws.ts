@@ -46,6 +46,14 @@ export interface RunEventMessage {
 
 export type RunEventKind =
   | 'started'
+  /**
+   * A line on the CUSTOMER'S timeline — the portal's default view of a
+   * run. Few per run, in the customer's language, never mechanics.
+   * Payload: { message, level: 'ok'|'warn'|'stopped', detail?: string[],
+   * artifact?: string }. Vendored copy — keep in sync with
+   * ambitagent-admin/packages/shared-protocol/src/ws.ts.
+   */
+  | 'milestone'
   | 'progress'
   | 'screenshot' // legacy — prefer `artifact` for new work
   | 'log'

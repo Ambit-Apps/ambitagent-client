@@ -432,6 +432,31 @@ function createRuntimeCtx({
       return { ...bundle };
     },
 
+    /**
+     * The customer's timeline. Same event stream, kind='milestone', so the
+     * portal can render these alone as the default view and leave
+     * progress/log to the Log tab. Carries `level` ('ok' | 'warn' |
+     * 'stopped'), optional `detail` bullets and an optional `artifact`
+     * label naming a screenshot to show beside the line.
+     */
+    milestone(
+      msg: string,
+      opts?: { level?: 'ok' | 'warn' | 'stopped'; detail?: string[]; artifact?: string },
+    ) {
+      emit({
+        type: 'run_event',
+        runId,
+        kind: 'milestone',
+        ts: nowTs(),
+        payload: {
+          message: msg,
+          level: opts?.level ?? 'ok',
+          ...(opts?.detail?.length ? { detail: opts.detail } : {}),
+          ...(opts?.artifact ? { artifact: opts.artifact } : {}),
+        },
+      });
+    },
+
     progress(msg: string) {
       emit({
         type: 'run_event',
