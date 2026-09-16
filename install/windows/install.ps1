@@ -298,6 +298,15 @@ if (-not (Test-Path $SrcWrapper)) {
 Write-Info "Installing wrapper to $WrapperFile..."
 Copy-Item -Path $SrcWrapper -Destination $WrapperFile -Force
 
+# Remove any run-daemon.vbs left by a prior installer version. We used to
+# launch the daemon through a hidden VBScript to suppress the console
+# window, but that orphaned node on Stop (WScript.Shell.Run spawns outside
+# the task's job object). The wrapper now hides its own window via
+# FreeConsole while staying Task Scheduler's direct in-job child, so the
+# VBScript is gone and must not linger.
+$StaleVbs = Join-Path $InstallRoot 'run-daemon.vbs'
+if (Test-Path $StaleVbs) { Remove-Item -Path $StaleVbs -Force -ErrorAction SilentlyContinue }
+
 # --- Scheduled Task registration -------------------------------------
 # Idempotence: remove any prior task before re-registering.
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -306,9 +315,14 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 Write-Info "Registering Scheduled Task '$TaskName' (at logon of $RunAsUser)..."
+# Launch through conhost.exe so the console uses the classic host, not
+# Windows Terminal. WT ignores -WindowStyle Hidden and can't be hidden in
+# process (its window is a separate windowsterminal.exe); conhost honors
+# it. node shares this hidden console, so Task Scheduler's Stop tears the
+# whole tree down via the shared-console cascade (no orphaned daemon).
 $action = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperFile`""
+    -Execute 'conhost.exe' `
+    -Argument "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperFile`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $RunAsUser
 # LogonType Interactive: task fires ONLY when the user has an interactive
 # session (visible desktop). Perfect for showing Chrome when a run

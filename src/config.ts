@@ -52,6 +52,24 @@ export interface Config {
    * logins here never touch the customer's real browsing profile.
    */
   chromeProfileDir: string;
+  /**
+   * Launch the managed Chrome with GPU/hardware acceleration disabled
+   * (`--disable-gpu`). Default false. Set `AMBIT_CHROME_DISABLE_GPU=true`
+   * on machines whose GPU driver crashes the renderer on heavy pages.
+   *
+   * Why this exists: on some older Intel iGPUs (e.g. UHD 620, Gen 9) the
+   * driver can't reset a lost D3D device inside Chrome's sandbox, so
+   * Chrome applies the `exit_on_context_lost` workaround — it KILLS the
+   * GPU process on any device-loss event (a display sleep, a monitor/DPI
+   * change, a TDR under a heavy render). That takes every tab's renderer
+   * down with it, surfacing to an automation script as "Target page,
+   * context or browser has been closed" mid-run. Forcing software
+   * rendering removes the hardware D3D path entirely so device-loss can't
+   * happen. A command-line flag also overrides any enterprise policy that
+   * locks hardware acceleration on. Slower to paint, but crash-proof —
+   * the right trade on a machine that's already crawling on the hw path.
+   */
+  chromeDisableGpu: boolean;
 }
 
 function readSystemConfig(): Record<string, string> {
@@ -127,6 +145,9 @@ export function loadConfig(): Config {
   const chromeEnabledRaw = optional('AMBIT_CHROME_ENABLED', fileConfig, 'true').toLowerCase();
   const chromeEnabled = chromeEnabledRaw !== 'false' && chromeEnabledRaw !== '0';
 
+  const disableGpuRaw = optional('AMBIT_CHROME_DISABLE_GPU', fileConfig, 'false').toLowerCase();
+  const chromeDisableGpu = disableGpuRaw === 'true' || disableGpuRaw === '1';
+
   return {
     adminUrl,
     wsUrl: deriveWsUrl(adminUrl),
@@ -148,5 +169,6 @@ export function loadConfig(): Config {
       fileConfig,
       join(homedir(), '.ambit', 'chrome-profile'),
     ),
+    chromeDisableGpu,
   };
 }

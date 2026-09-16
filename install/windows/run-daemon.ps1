@@ -15,6 +15,39 @@
 $ErrorActionPreference = 'Continue'   # keep going through non-fatal errors
 Set-StrictMode -Version 3.0
 
+# --- hide the console window -----------------------------------------
+# Task Scheduler launches this wrapper via `conhost.exe powershell.exe
+# -WindowStyle Hidden ...` (see install.ps1). Routing through conhost.exe
+# forces the CLASSIC console host instead of Windows Terminal. This matters
+# for TWO reasons that we learned the hard way:
+#
+#   1. Hiding: Windows Terminal ignores -WindowStyle Hidden and cannot be
+#      hidden from inside the process (its window belongs to a separate
+#      windowsterminal.exe). conhost honors -WindowStyle Hidden, and the
+#      ShowWindow(SW_HIDE) below reinforces it.
+#   2. Teardown: node must SHARE this console. Task Scheduler's Stop
+#      destroys the wrapper's console, which takes the node child down with
+#      it — that shared-console cascade IS the teardown. Anything that
+#      gives node its own console (FreeConsole) or spawns it outside the
+#      job (a wscript/ShellExecute launcher) orphans node — it keeps
+#      running and reporting "online" after Stop. Both were tried; both
+#      failed. Do not reintroduce them.
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'AmbitConsole.AmbitWin').Type) {
+        Add-Type -Namespace 'AmbitConsole' -Name 'AmbitWin' -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]   public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@
+    }
+    $consoleHandle = [AmbitConsole.AmbitWin]::GetConsoleWindow()
+    if ($consoleHandle -ne [System.IntPtr]::Zero) {
+        [AmbitConsole.AmbitWin]::ShowWindow($consoleHandle, 0) | Out-Null   # 0 = SW_HIDE
+    }
+} catch {
+    # Non-fatal: worst case the window stays visible. Never let a hide
+    # failure stop the runtime.
+}
+
 $AppDir     = 'C:\Program Files\Ambit Agent\app'
 $ConfigFile = 'C:\ProgramData\Ambit Agent\config'
 $LogsDir    = 'C:\ProgramData\Ambit Agent\logs'
@@ -66,19 +99,21 @@ if (-not (Test-Path $MainJs)) {
 
 Set-Location $AppDir
 
-# Foreground invocation. Runs node as a direct child of THIS PowerShell
-# process, in the same session and process tree.
+# Foreground invocation — node runs as a direct child of THIS PowerShell,
+# sharing its (hidden) console, with stdout/stderr appended to the logs.
+# This is the launch that reliably brings the daemon online; Start-Process
+# variants launched node with the wrong working dir / no stdin and it
+# exited immediately (code -1).
 #
-# Why not Start-Process -Wait: Task Scheduler's "Stop" action kills only
-# the PowerShell process it launched, not its children. Start-Process
-# spawned children survive that kill and become orphan daemons — each
-# Stop→Start cycle then leaves the old node alive alongside the new one,
-# and multiple daemons race on the same enrollment token (visible as
-# "Superseded by new connection" churn in the admin logs). Foreground `&`
-# invocation keeps node as a real child so it dies with the wrapper.
-#
-# Stream redirection: `1>>` appends stdout, `2>>` appends stderr, both
-# native PowerShell operators that work on external processes' streams.
+# NOTE — teardown on task Stop is deliberately NOT handled here. On this
+# Windows build, Task Scheduler's Stop kills only conhost (our parent) and
+# does NOT cascade to node, so a stopped task can leave node running
+# ("online" in the portal). Every wrapper-side attempt to fix that failed
+# (shared-console cascade doesn't happen; FreeConsole gives node its own
+# console; a wscript/ShellExecute launcher and Start-Process supervision
+# broke startup or orphaned node). The durable fix belongs in the node
+# daemon itself — the one process guaranteed to survive the Stop. Until
+# then, to fully stop the runtime, kill the Ambit node process directly.
 $node = (Get-Command node).Source
 & $node $MainJs 1>>$StdoutLog 2>>$StderrLog
 

@@ -7,8 +7,10 @@ customer's desktop for headful browser agents (e.g. driver-wave-assignment
 which uses `browser.model: "attached_chrome"`).
 
 Distribution is via email attachment — no public repo, no PAT, no git.
-The customer receives three files, saves them into a single folder, and
-runs `install.ps1` as Administrator.
+The customer receives four files, saves them into a single folder, and
+**double-clicks `install.bat`**. That wrapper self-elevates, clears the
+"downloaded from the internet" block, and runs `install.ps1` — so the
+customer never has to open PowerShell or type any commands.
 
 ## Why Task Scheduler (not a Windows service)
 
@@ -25,12 +27,13 @@ CG Logistics.
 
 ## What you (staff) ship
 
-Three files, all attached to one email. The customer saves all three
+Four files, all attached to one email. The customer saves all four
 into the same folder (typically Downloads).
 
 | File | Source | Notes |
 |---|---|---|
-| `install.ps1` | `install/windows/install.ps1` in this repo | Same file for every customer. |
+| `install.bat` | `install/windows/install.bat` in this repo | Same file for every customer. The customer double-clicks THIS one. |
+| `install.ps1` | `install/windows/install.ps1` in this repo | Same file for every customer. Invoked by `install.bat`. |
 | `run-daemon.ps1` | `install/windows/run-daemon.ps1` in this repo | Same file for every customer. |
 | `ambitagent-client-<stamp>-<sha>.zip` | Produced by `install/build-installer-zip.sh` | Rebuilt on every client version bump. |
 
@@ -58,30 +61,46 @@ Output is `.gitignore`d.
 
 ## Customer install — the one-time flow
 
-1. Save all three attachments from the install email into the SAME
+1. Save all four attachments from the install email into the SAME
    folder (typically Downloads).
-2. Right-click **`install.ps1`** → **Run with PowerShell** (as
-   Administrator). If Windows blocks with a "script from the internet"
-   warning, run `Unblock-File .\install.ps1` first (or set
-   ExecutionPolicy for the session via
-   `powershell.exe -ExecutionPolicy Bypass -File .\install.ps1`).
-3. When prompted:
+2. **Double-click `install.bat`.**
+   - If a blue "Windows protected your PC" / "Open File – Security
+     Warning" box appears, click **More info → Run anyway** (or
+     **Run**) — expected for an emailed file, one click.
+   - A **User Account Control** prompt appears asking for administrator
+     access — click **Yes**.
+3. When prompted (in the black installer window):
    - **Admin URL:** paste from email body (e.g.
      `https://ambitagent-prod.herokuapp.com`).
    - **Enrollment token:** paste from email body.
-   - **Run-as user:** press Enter to accept the current user (this is
-     usually correct — it's whoever will actually be logged in when
-     runs are triggered).
-4. Wait ~5 min (Node install via winget + `npm ci` + Playwright
-   Chromium download).
+   - **Run-as user:** press Enter to accept the current user — correct
+     as long as the person installing is the same one who will be logged
+     in when runs are triggered. (If you clicked **Yes** on UAC using a
+     *separate* admin account, type the everyday login here instead —
+     `DOMAIN\username`.)
+4. Wait ~5 min. The script installs any missing prerequisites
+   (Node.js LTS and Google Chrome via winget), then runs `npm ci`,
+   builds, and downloads Playwright's Chromium.
 5. Done. If the run-as user matches the current session, the task
    starts immediately; otherwise it fires next time that user logs in.
 
-That's it — no environment variables, no TLS settings, no pre-flight
-lines to paste. The script handles all of that internally.
+That's it — no PowerShell, no environment variables, no TLS settings,
+no `Unblock-File` or ExecutionPolicy commands. `install.bat` handles
+elevation and the internet-block, and `install.ps1` handles everything
+else internally.
 
 The runtime appears **online** in your portal (`/staff/runtimes`)
 within ~15 s of the daemon starting.
+
+### Fallback: running install.ps1 directly (advanced)
+
+If a locked-down machine blocks `.bat` files, or you're driving the
+install from an already-elevated PowerShell, you can skip the wrapper:
+right-click **`install.ps1`** → **Run with PowerShell** as
+Administrator. If Windows blocks it with a "script from the internet"
+warning, run `Unblock-File .\install.ps1` first, or launch it via
+`powershell.exe -ExecutionPolicy Bypass -File .\install.ps1`. This is
+exactly what `install.bat` automates.
 
 ### First-run browser login (once per customer)
 
@@ -115,10 +134,13 @@ Stop-ScheduledTask -TaskName AmbitAgentRuntime; Start-ScheduledTask -TaskName Am
 ## Upgrade
 
 Ship a new `.zip` (build with `build-installer-zip.sh`). Customer
-drops the new zip into the same folder as `install.ps1` (replacing
-the old one) and re-runs `install.ps1` as Administrator. Config file
+drops the new zip into the same folder as `install.bat` (replacing
+the old one) and double-clicks `install.bat` again. Config file
 and Chrome profile are preserved; only the source under
 `C:\Program Files\Ambit Agent\app\` is wiped and re-extracted.
+(You only need to re-send the `.zip` on a version bump — the customer
+already has `install.bat` / `install.ps1` / `run-daemon.ps1` from the
+first install, though re-sending all four is harmless.)
 
 ## Uninstall
 
@@ -148,7 +170,11 @@ generations of installs.
 
 Not needed for a normal manual install — the script prompts for
 everything. Useful when scripting installs across many machines
-(e.g. from a fleet-management tool). Set before running `install.ps1`:
+(e.g. from a fleet-management tool). Set before running `install.ps1`.
+Note: fleet automation should call `install.ps1` directly (already
+elevated, non-interactive) rather than `install.bat` — the wrapper's
+self-elevation raises an interactive UAC prompt, and its relaunch
+starts a fresh process that won't inherit env vars set in your shell.
 
 | Var | Default | Notes |
 |---|---|---|
@@ -157,6 +183,21 @@ everything. Useful when scripting installs across many machines
 | `$env:AMBIT_RUN_AS_USER` | current interactive user | `DOMAIN\username` — the user whose logon triggers the task. |
 | `$env:AMBIT_HEADLESS` | `false` | User-session mode CAN show Chrome; keep `false` unless there's a reason. |
 | `$env:AMBIT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+
+## Runtime config-file options
+
+The daemon reads `KEY=VALUE` lines from `C:\ProgramData\Ambit Agent\config`
+at startup (this is the same file that holds `ADMIN_URL` and
+`ENROLLMENT_TOKEN`). Add or edit a line, then restart the task:
+`Stop-ScheduledTask -TaskName AmbitAgentRuntime; Start-ScheduledTask -TaskName AmbitAgentRuntime`.
+
+| Key | Default | When to set it |
+|---|---|---|
+| `AMBIT_CHROME_DISABLE_GPU` | `false` | Set to `true` on a machine where Chrome crashes mid-run (the managed Chrome window vanishes, a browser agent errors with "Target page, context or browser has been closed", and it's NOT a memory problem). Forces software rendering (`--disable-gpu`), which trades a little paint speed for stability. Seen on older Intel iGPUs (e.g. UHD 620) whose driver kills the GPU process on device-loss. Overrides any enterprise policy that locks hardware acceleration on. |
+
+Note: browser-agent behavior on genuinely slow machines is also tunable
+per run via the agent's own inputs (e.g. driver-wave-assignment's
+`page_load_timeout_ms`) — those live in the admin run form, not this file.
 
 ## Troubleshooting
 
@@ -190,18 +231,30 @@ Get-ScheduledTask -TaskName AmbitAgentRuntime | Format-List
 
 **winget missing.**
 
-Windows 10 pre-21H2 doesn't ship App Installer (winget). Either
-upgrade to Win 11 or pre-install Node.js LTS x64 manually from
-<https://nodejs.org/en/download/> — the installer detects an existing
-`node` on PATH and skips the winget step. TLS is already handled inside
+Windows 10 pre-21H2 doesn't ship App Installer (winget). The installer
+uses winget to install two prerequisites if they're absent — **Node.js
+LTS x64** and **Google Chrome** — so without winget you must pre-install
+whichever is missing, then re-run:
+
+- Node.js LTS x64 — <https://nodejs.org/en/download/> (the installer
+  detects an existing `node` >= 20 on PATH and skips it).
+- Google Chrome — <https://www.google.com/chrome/> (the installer
+  detects Chrome in the standard install locations and skips it).
+
+Real Google Chrome — not Playwright's bundled Chromium — is required
+because the browser agents attach to it (`attached_chrome`) for the
+real fingerprint and Web Store extensions. TLS is already handled inside
 `install.ps1` (it forces TLS 1.2/1.3 at the top), so the once-common
 "pre-run this TLS line" workaround is no longer needed.
 
 ## Hardening TODOs (deferred, Phase 2)
 
-- **MSI installer with code-signing cert.** Double-click UX, no
-  PowerShell literacy required. Requires ~$200/yr code-signing cert.
-  Worth it when you have 5+ customers.
+- **MSI installer with code-signing cert.** `install.bat` already gives
+  the double-click, no-PowerShell-literacy UX; the remaining gap an MSI
+  would close is the SmartScreen / "Open File – Security Warning" prompt
+  (an unsigned emailed `.bat` still triggers a one-click warning). A
+  code-signing cert (~$200/yr) removes that prompt. Worth it when you
+  have 5+ customers.
 - **Auto-update.** Currently the customer receives a new zip via email
   and re-runs the installer. Fine for pilot; automate once >1
   customer.
