@@ -184,6 +184,21 @@ starts a fresh process that won't inherit env vars set in your shell.
 | `$env:AMBIT_HEADLESS` | `false` | User-session mode CAN show Chrome; keep `false` unless there's a reason. |
 | `$env:AMBIT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
+## Runtime config-file options
+
+The daemon reads `KEY=VALUE` lines from `C:\ProgramData\Ambit Agent\config`
+at startup (this is the same file that holds `ADMIN_URL` and
+`ENROLLMENT_TOKEN`). Add or edit a line, then restart the task:
+`Stop-ScheduledTask -TaskName AmbitAgentRuntime; Start-ScheduledTask -TaskName AmbitAgentRuntime`.
+
+| Key | Default | When to set it |
+|---|---|---|
+| `AMBIT_CHROME_DISABLE_GPU` | `false` | Set to `true` on a machine where Chrome crashes mid-run (the managed Chrome window vanishes, a browser agent errors with "Target page, context or browser has been closed", and it's NOT a memory problem). Forces software rendering (`--disable-gpu`), which trades a little paint speed for stability. Seen on older Intel iGPUs (e.g. UHD 620) whose driver kills the GPU process on device-loss. Overrides any enterprise policy that locks hardware acceleration on. |
+
+Note: browser-agent behavior on genuinely slow machines is also tunable
+per run via the agent's own inputs (e.g. driver-wave-assignment's
+`page_load_timeout_ms`) — those live in the admin run form, not this file.
+
 ## Troubleshooting
 
 **Runtime stays offline in the portal.**
