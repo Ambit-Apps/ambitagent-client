@@ -119,6 +119,14 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
       let browser: Awaited<ReturnType<typeof launchBrowser>> | null = null;
       const isBrowserType = await bundleUsesPlaywright(msg);
 
+      // Shared with ctx so the runtime can tell whether the agent said how
+      // the run ended. Every run owes the customer exactly one outcome
+      // line; if the agent writes its own we leave it alone, and if it
+      // doesn't we add a generic one rather than let a run finish saying
+      // nothing. Declared out here because the failure and cancel paths
+      // below need it just as much as the success path does.
+      const runState = { sawOutcome: false };
+
       try {
         // 1) Write every file.
         for (const f of msg.files) {
@@ -250,6 +258,7 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
 
         // 6) Build ctx + execute.
         const ctx = createRuntimeCtx({
+          runState,
           runId: msg.runId,
           inputs: msg.inputs,
           credentials: msg.credentials ?? {},
@@ -292,6 +301,20 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
         // already returned via the race.
         runScript.catch(() => { /* orphaned, handled via race */ });
 
+        // C is guaranteed, not requested. An agent that never adopted
+        // milestones still owes the customer a line saying where the run
+        // landed, and Timeline is the default view - so a run that says
+        // nothing reads as a run that did nothing.
+        if (!runState.sawOutcome) {
+          emit({
+            type: 'run_event',
+            runId: msg.runId,
+            kind: 'milestone',
+            ts: nowTs(),
+            payload: { message: 'Finished', phase: 'outcome', level: 'ok' },
+          });
+        }
+
         emit({
           type: 'run_event',
           runId: msg.runId,
@@ -311,6 +334,19 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           e instanceof CancelledError || signal?.aborted === true;
         if (wasCancelled) {
           log.info({ runId: msg.runId }, 'run cancelled — teardown complete');
+          if (!runState.sawOutcome) {
+            emit({
+              type: 'run_event',
+              runId: msg.runId,
+              kind: 'milestone',
+              ts: nowTs(),
+              payload: {
+                message: 'Stopped — this run was cancelled',
+                phase: 'outcome',
+                level: 'stopped',
+              },
+            });
+          }
           emit({
             type: 'run_event',
             runId: msg.runId,
@@ -320,6 +356,22 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           });
         } else {
           log.error({ runId: msg.runId, err: e.message, stack: e.stack }, 'run failed');
+          // 'stopped', never 'warn': the run did not finish, so whatever
+          // it was meant to do is still outstanding.
+          if (!runState.sawOutcome) {
+            emit({
+              type: 'run_event',
+              runId: msg.runId,
+              kind: 'milestone',
+              ts: nowTs(),
+              payload: {
+                message: "Stopped — this run didn't finish",
+                phase: 'outcome',
+                level: 'stopped',
+                detail: [e.message],
+              },
+            });
+          }
           emit({
             type: 'run_event',
             runId: msg.runId,
@@ -359,6 +411,7 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
  * either side.
  */
 function createRuntimeCtx({
+  runState,
   runId,
   inputs,
   credentials,
@@ -368,6 +421,7 @@ function createRuntimeCtx({
   config,
   signal,
 }: {
+  runState: { sawOutcome: boolean };
   runId: string;
   inputs: unknown;
   credentials: Record<string, Record<string, string>>;
@@ -441,8 +495,17 @@ function createRuntimeCtx({
      */
     milestone(
       msg: string,
-      opts?: { level?: 'ok' | 'warn' | 'stopped'; detail?: string[]; artifact?: string },
+      opts?: {
+        phase?: 'access' | 'work' | 'waiting' | 'outcome';
+        level?: 'ok' | 'warn' | 'stopped';
+        detail?: string[];
+        artifact?: string;
+      },
     ) {
+      const phase = opts?.phase ?? 'work';
+      // Remember that the agent said how the run ended, so the runtime
+      // does not add a generic outcome on top of a specific one.
+      if (phase === 'outcome') runState.sawOutcome = true;
       emit({
         type: 'run_event',
         runId,
@@ -450,6 +513,7 @@ function createRuntimeCtx({
         ts: nowTs(),
         payload: {
           message: msg,
+          phase,
           level: opts?.level ?? 'ok',
           ...(opts?.detail?.length ? { detail: opts.detail } : {}),
           ...(opts?.artifact ? { artifact: opts.artifact } : {}),
@@ -726,6 +790,23 @@ function createRuntimeCtx({
       if (!spec || typeof spec !== 'object') {
         throw new Error('ctx.awaitApproval: spec is required');
       }
+
+      // W is emitted for the agent, not by it. This pause is usually the
+      // longest thing on a timeline - 21 minutes in run_35 - and an
+      // unexplained gap reads as the agent having hung. Since only the
+      // platform knows a run is parked on a human, the platform says so,
+      // and no agent can forget to.
+      emit({
+        type: 'run_event',
+        runId,
+        kind: 'milestone',
+        ts: nowTs(),
+        payload: {
+          message: spec.title ? `Waiting for you: ${spec.title}` : 'Waiting for your review',
+          phase: 'waiting',
+          level: 'warn',
+        },
+      });
 
       // POST is upsert-on-(run_id, approval_key). Existing row returns
       // as-is; a fresh row is created + task_run flipped to awaiting_input
