@@ -48,9 +48,17 @@ export type RunEventKind =
   | 'started'
   /**
    * A line on the CUSTOMER'S timeline — the portal's default view of a
-   * run. Few per run, in the customer's language, never mechanics.
-   * Payload: { message, level: 'ok'|'warn'|'stopped', detail?: string[],
-   * artifact?: string }. Vendored copy — keep in sync with
+   * run. Few per run, in the customer's language, never mechanics: the
+   * line is a GOAL, and the per-item receipts hang off it collapsed.
+   * Payload: {
+   *   message,
+   *   phase?: 'access'|'work'|'waiting'|'outcome',
+   *   level: 'ok'|'warn'|'stopped',
+   *   detail?: string[],   // collapsed rows, one per item
+   *   summary?: string,    // disclosure label, e.g. "38 writes"
+   *   callout?: string[],  // never collapsed — what they must act on
+   *   artifact?: string,
+   * }. Vendored copy — keep in sync with
    * ambitagent-admin/packages/shared-protocol/src/ws.ts.
    */
   | 'milestone'

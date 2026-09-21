@@ -368,7 +368,7 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
                 message: "Stopped — this run didn't finish",
                 phase: 'outcome',
                 level: 'stopped',
-                detail: [e.message],
+                callout: [e.message],
               },
             });
           }
@@ -489,9 +489,18 @@ function createRuntimeCtx({
     /**
      * The customer's timeline. Same event stream, kind='milestone', so the
      * portal can render these alone as the default view and leave
-     * progress/log to the Log tab. Carries `level` ('ok' | 'warn' |
-     * 'stopped'), optional `detail` bullets and an optional `artifact`
-     * label naming a screenshot to show beside the line.
+     * progress/log to the Log tab.
+     *
+     * The line itself is a GOAL. Everything per-item hangs off it:
+     *   - `detail`  the receipts, collapsed behind `summary`. Every
+     *               driver, every row. Built with `timelineRows()`.
+     *   - `summary` the disclosure label — "38 writes".
+     *   - `callout` the 1-2 lines that must NOT collapse, because the
+     *               customer has to act on them.
+     *   - `artifact` a screenshot uploaded this run, shown beside it.
+     *
+     * Forwarded verbatim: the runtime does not get to decide what is
+     * worth showing a customer, only that the line arrives.
      */
     milestone(
       msg: string,
@@ -499,6 +508,8 @@ function createRuntimeCtx({
         phase?: 'access' | 'work' | 'waiting' | 'outcome';
         level?: 'ok' | 'warn' | 'stopped';
         detail?: string[];
+        summary?: string;
+        callout?: string[];
         artifact?: string;
       },
     ) {
@@ -516,6 +527,8 @@ function createRuntimeCtx({
           phase,
           level: opts?.level ?? 'ok',
           ...(opts?.detail?.length ? { detail: opts.detail } : {}),
+          ...(opts?.summary ? { summary: opts.summary } : {}),
+          ...(opts?.callout?.length ? { callout: opts.callout } : {}),
           ...(opts?.artifact ? { artifact: opts.artifact } : {}),
         },
       });
