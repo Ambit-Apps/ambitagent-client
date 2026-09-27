@@ -50,9 +50,56 @@ import { detectChromeBinary, chromeInstallHint } from './detect.js';
  */
 
 const BACKOFF_MS = [1_000, 5_000, 30_000, 120_000] as const;
-const HEALTH_POLL_INTERVAL_MS = 10_000;
 const HEALTH_STARTUP_TIMEOUT_MS = 30_000;
 const CDP_HEALTH_PATH = '/json/version';
+
+/**
+ * Health-probe tuning. Env-overridable ON PURPOSE: these are the numbers
+ * that decide whether a slow machine's Chrome gets killed mid-run, and
+ * getting a corrected build onto a customer laptop is far more expensive
+ * than editing one line of `C:\ProgramData\Ambit Agent\config`. Tune there
+ * first; only change the defaults if a value turns out to be wrong for
+ * everyone.
+ *
+ * Read LAZILY (functions, not consts) so an override always wins no matter
+ * when it lands in `process.env`. A module-load read looks equivalent and is
+ * not: `loadConfig()` merges the config FILE into `process.env` at runtime,
+ * which happens after this module is imported, so a file-only override would
+ * have been silently ignored.
+ */
+function envInt(name: string, def: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
+}
+
+const healthPollIntervalMs = () => envInt('AMBIT_CHROME_HEALTH_INTERVAL_MS', 10_000);
+
+/**
+ * How long one CDP probe may take before it counts as a failure.
+ *
+ * Was a hardcoded 5s, on the theory that "a healthy browser answers in
+ * milliseconds". True — but a browser that is *busy* is not unhealthy, and
+ * `--disable-gpu` software rendering on an old iGPU saturates every core
+ * while painting a heavy grid. The browser process then can't service
+ * `Target.getTargets` inside 5s and we shot a perfectly alive Chrome.
+ */
+const healthPingTimeoutMs = () => envInt('AMBIT_CHROME_HEALTH_PING_TIMEOUT_MS', 15_000);
+
+/**
+ * Consecutive failed probes required before we treat Chrome as dead.
+ *
+ * WHY THIS IS NOT 1 (it was, and it cost a customer three nights of runs).
+ * A single missed probe is indistinguishable from "Chrome is mid-render on a
+ * slow laptop". The old code SIGKILLed on the first failure, which meant the
+ * heavier the page, the more likely we were to kill the very Chrome an agent
+ * was actively driving — surfacing to the agent as the maddening
+ * `Target page, context or browser has been closed`. Requiring N in a row
+ * means Chrome has to be unresponsive for roughly
+ * N × healthPollIntervalMs() before it dies, so transient render storms are
+ * ridden out while a genuinely dead Chrome is still reaped (~30-45s) and
+ * restarted for the next run.
+ */
+const healthMaxFailures = () => envInt('AMBIT_CHROME_HEALTH_MAX_FAILURES', 3);
 
 const WELCOME_TAB_HTML = `
 <!doctype html>
@@ -157,6 +204,9 @@ class RealChromeManager implements ChromeManager {
   private process: ChildProcess | null = null;
   private healthTimer: NodeJS.Timeout | null = null;
   private restartAttempt = 0;
+  /** Consecutive failed health probes. Reset by any success, and on every
+   *  state transition, so a streak can never leak across Chrome instances. */
+  private healthFailures = 0;
   private readyResolvers: Array<(url: string) => void> = [];
   private readyRejecters: Array<(err: Error) => void> = [];
   private url: string;
@@ -457,40 +507,67 @@ class RealChromeManager implements ChromeManager {
     this.readyResolvers = [];
     this.readyRejecters = [];
 
-    // Start the ongoing health check.
+    // Start the ongoing health check. Clear any streak carried over from a
+    // previous Chrome instance — this one has answered, by definition.
+    this.healthFailures = 0;
     if (this.healthTimer) clearInterval(this.healthTimer);
-    this.healthTimer = setInterval(() => void this.checkHealth(), HEALTH_POLL_INTERVAL_MS);
+    this.healthTimer = setInterval(() => void this.checkHealth(), healthPollIntervalMs());
   }
 
   private async checkHealth(): Promise<void> {
     if (this.state !== 'ready') return;
     const ok = await this.pingCdp();
-    if (!ok) {
-      this.log.warn({ url: this.url }, 'managed Chrome health check failed');
-      if (process.platform === 'darwin') {
-        // On macOS we don't hold a live ChildProcess for Chrome (it was
-        // launched via `open`, whose process has long since exited), so
-        // we can't distinguish user-close from crash via an exit code.
-        // Default to user-close semantics: go idle, wait for the next
-        // agent run to relaunch. If it was really a crash, the customer
-        // barely notices — their next Run relaunches Chrome anyway.
-        // Small trade-off (no auto-recovery on crash for Mac) in exchange
-        // for consistent Q1=A/Q2=A behavior across platforms.
-        this.log.info('Chrome disappeared on darwin — treating as user-close, going idle');
+    if (ok) {
+      // Any success clears the streak — we only act on SUSTAINED silence.
+      if (this.healthFailures > 0) {
+        this.log.info(
+          { after: this.healthFailures },
+          'managed Chrome answered again — health failure streak cleared',
+        );
+        this.healthFailures = 0;
+      }
+      return;
+    }
+
+    this.healthFailures += 1;
+    this.log.warn(
+      { url: this.url, failures: this.healthFailures, threshold: healthMaxFailures() },
+      'managed Chrome health check failed',
+    );
+
+    // Not dead yet — a busy Chrome is allowed to miss probes. Only a streak
+    // that reaches the threshold is treated as a real death.
+    if (this.healthFailures < healthMaxFailures()) return;
+
+    this.log.warn(
+      { failures: this.healthFailures, thresholdMs: this.healthFailures * healthPollIntervalMs() },
+      'managed Chrome unresponsive for the full threshold — treating as dead',
+    );
+    this.healthFailures = 0;
+
+    if (process.platform === 'darwin') {
+      // On macOS we don't hold a live ChildProcess for Chrome (it was
+      // launched via `open`, whose process has long since exited), so
+      // we can't distinguish user-close from crash via an exit code.
+      // Default to user-close semantics: go idle, wait for the next
+      // agent run to relaunch. If it was really a crash, the customer
+      // barely notices — their next Run relaunches Chrome anyway.
+      // Small trade-off (no auto-recovery on crash for Mac) in exchange
+      // for consistent Q1=A/Q2=A behavior across platforms.
+      this.log.info('Chrome disappeared on darwin — treating as user-close, going idle');
+      this.goIdle();
+    } else {
+      // Linux/Windows: kill our ChildProcess so its exit handler fires
+      // and classifies as user-close vs crash based on exit code.
+      // Single entry point avoids double-firing scheduleRestart.
+      const p = this.process;
+      if (p && !p.killed) {
+        try { p.kill('SIGKILL'); } catch { /* ignore */ }
+      } else if (!p) {
+        // No process but state says ready — inconsistent. Force-idle
+        // rather than restart; user-facing behavior stays predictable.
+        this.log.warn('health check failed but no ChildProcess to signal — going idle');
         this.goIdle();
-      } else {
-        // Linux/Windows: kill our ChildProcess so its exit handler fires
-        // and classifies as user-close vs crash based on exit code.
-        // Single entry point avoids double-firing scheduleRestart.
-        const p = this.process;
-        if (p && !p.killed) {
-          try { p.kill('SIGKILL'); } catch { /* ignore */ }
-        } else if (!p) {
-          // No process but state says ready — inconsistent. Force-idle
-          // rather than restart; user-facing behavior stays predictable.
-          this.log.warn('health check failed but no ChildProcess to signal — going idle');
-          this.goIdle();
-        }
       }
     }
   }
@@ -505,6 +582,7 @@ class RealChromeManager implements ChromeManager {
   private goIdle(): void {
     this.state = 'idle';
     this.restartAttempt = 0;
+    this.healthFailures = 0;
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
       this.healthTimer = null;
@@ -558,7 +636,11 @@ class RealChromeManager implements ChromeManager {
   private async pingCdp(): Promise<boolean> {
     let wsUrl: string;
     try {
-      const res = await fetch(`${this.url}${CDP_HEALTH_PATH}`);
+      // Bounded: an unbounded fetch against a wedged-but-listening Chrome
+      // would hang this probe forever, which silently disables the monitor.
+      const res = await fetch(`${this.url}${CDP_HEALTH_PATH}`, {
+        signal: AbortSignal.timeout(healthPingTimeoutMs()),
+      });
       if (!res.ok) return false;
       const body = (await res.json()) as { webSocketDebuggerUrl?: string };
       if (!body.webSocketDebuggerUrl) return false;
@@ -577,10 +659,10 @@ class RealChromeManager implements ChromeManager {
         try { sock?.close(); } catch { /* already gone */ }
         resolve(ok);
       };
-      // Short: a healthy browser answers in milliseconds, and a slow
-      // "yes" is not worth waiting for when the alternative is a run
-      // that fails half a minute later.
-      const timer = setTimeout(() => finish(false), 5_000);
+      // A healthy browser answers in milliseconds — but a BUSY one can take
+      // seconds, and "busy" must not read as "dead" (see healthMaxFailures).
+      // A slow yes still beats killing a Chrome an agent is driving.
+      const timer = setTimeout(() => finish(false), healthPingTimeoutMs());
       try {
         sock = new WebSocket(wsUrl);
         sock.onopen = () => sock?.send(JSON.stringify({ id: 1, method: 'Target.getTargets' }));
