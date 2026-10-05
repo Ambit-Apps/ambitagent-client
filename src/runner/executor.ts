@@ -228,6 +228,14 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
             persistentProfileDir,
             model,
             attachCdpUrl,
+            // Used only to match an already-open tab by hostname, so a run
+            // lands on the signed-in tab instead of a new blank one beside it.
+            inputs: (msg.inputs ?? {}) as Record<string, unknown>,
+            onTabChosen: (reused, reason) =>
+              log.info(
+                { runId: msg.runId, reusedExistingTab: reused, reason },
+                reused ? 'reusing the already-open tab' : 'opened a new tab',
+              ),
             onPageRecreated: () =>
               log.info({ runId: msg.runId }, 'agent tab was closed — opened a replacement tab'),
             signal,

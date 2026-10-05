@@ -92,6 +92,17 @@ export interface LaunchOptions {
    * customers running the daemon.
    */
   attachCdpUrl?: string;
+  /**
+   * The run's inputs, used ONLY to work out which already-open tab this agent
+   * belongs on (see `pickStartingPage`). Never logged, never sent anywhere —
+   * inputs can carry customer data.
+   */
+  inputs?: Record<string, unknown>;
+  /**
+   * Called once the starting page is chosen, so the caller can log whether an
+   * existing tab was reused. This module does no logging of its own.
+   */
+  onTabChosen?: (reused: boolean, reason: string) => void;
   /** Called each time the self-healing page replaces a closed tab. */
   onPageRecreated?: () => void;
   /**
@@ -180,8 +191,90 @@ const BINARY_HINT =
   'Playwright Chromium binary is missing on this runtime. ' +
   'Install it with:  npx playwright install chromium';
 
+/**
+ * Every hostname the run's inputs point at.
+ *
+ * The agent is told where it is going — `ecw_login_url`, `url`, a dashboard
+ * link — and that is a far stronger signal about which tab it belongs on than
+ * anything the client could guess. Deliberately generic: no EMR or vendor names
+ * are hardcoded here, so this works for every agent without a manifest change,
+ * and an agent whose inputs contain no URL simply gets today's behaviour.
+ */
+function inputHostnames(inputs: Record<string, unknown> | undefined): Set<string> {
+  const hosts = new Set<string>();
+  for (const value of Object.values(inputs ?? {})) {
+    if (typeof value !== 'string') continue;
+    if (!/^https?:\/\//i.test(value)) continue;
+    try {
+      hosts.add(new URL(value).hostname.toLowerCase());
+    } catch {
+      /* a malformed URL is simply not a hint */
+    }
+  }
+  return hosts;
+}
+
+/**
+ * Reuse the already-authenticated tab when there is one, rather than opening a
+ * fresh one beside it.
+ *
+ * ── WHY ──
+ * The daemon-managed Chrome persists a profile so a human signs in once, and
+ * with `context.newPage()` every run opened a NEW tab next to the signed-in
+ * one. Tabs accumulate run after run, and an agent that expects to find itself
+ * already inside an application starts on `about:blank` instead.
+ *
+ * ── THE SAFETY RULE, WHICH IS THE WHOLE POINT ──
+ * A tab is only reused when its hostname matches a URL the agent was actually
+ * given. If nothing matches, we open a fresh tab — we never fall back to
+ * "whatever tab happens to be open". Ported from the Playwright repo's
+ * BaseTask, where that branch was load-bearing: staff had personal tabs open in
+ * the debug Chrome and the task would otherwise attach to one of them and fail
+ * in confusing ways.
+ *
+ * Polled, because a tab can briefly be `about:blank` right after Chrome boots
+ * or sit mid-redirect (eCW bounces the login URL to a load-balanced host), and
+ * grabbing it in that state is the same bug in slower motion.
+ *
+ * Only decides the page the agent STARTS on. Agents that open further tabs
+ * themselves are unaffected.
+ */
+async function pickStartingPage(
+  context: BrowserContext,
+  inputs: Record<string, unknown> | undefined,
+): Promise<{ page: Page; reused: boolean; reason: string }> {
+  const wanted = inputHostnames(inputs);
+  if (wanted.size === 0) {
+    return { page: await context.newPage(), reused: false, reason: 'no URL in inputs to match against' };
+  }
+
+  const POLL_MS = 200;
+  const ATTEMPTS = 15; // ~3s
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    for (const page of context.pages()) {
+      if (page.isClosed()) continue;
+      let host: string;
+      try {
+        host = new URL(page.url()).hostname.toLowerCase();
+      } catch {
+        continue; // about:blank and friends
+      }
+      if (wanted.has(host)) {
+        return { page, reused: true, reason: `matched ${host}` };
+      }
+    }
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+
+  return {
+    page: await context.newPage(),
+    reused: false,
+    reason: `no open tab matched ${[...wanted].join(', ')}`,
+  };
+}
+
 export async function launchBrowser(
-  { headless = true, persistentProfileDir, model, attachCdpUrl, onPageRecreated, signal }: LaunchOptions = {},
+  { headless = true, persistentProfileDir, model, attachCdpUrl, inputs, onTabChosen, onPageRecreated, signal }: LaunchOptions = {},
 ): Promise<BrowserHandle> {
   // Precedence:
   //   1. If the manifest declares model='attached_chrome', use attach mode
@@ -229,8 +322,11 @@ export async function launchBrowser(
       );
     }
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    const rawPage = await context.newPage();
-    const healed = selfHealingPage(context, rawPage, onPageRecreated, signal);
+    const picked = await pickStartingPage(context, inputs);
+    // This module deliberately does no logging of its own — the caller owns
+    // that, same as onPageRecreated.
+    onTabChosen?.(picked.reused, picked.reason);
+    const healed = selfHealingPage(context, picked.page, onPageRecreated, signal);
     return {
       page: healed.proxy,
       context,

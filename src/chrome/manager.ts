@@ -3,7 +3,12 @@ import { mkdir } from 'node:fs/promises';
 import { WebSocket } from 'ws';
 import type { Logger } from '../log.js';
 import type { Config } from '../config.js';
-import { detectChromeBinary, chromeInstallHint } from './detect.js';
+import {
+  chromeInstallHint,
+  detectChromeBinary,
+  DEVTOOLS_POLICY_FIX,
+  devToolsDisabledReason,
+} from './detect.js';
 
 /**
  * Managed-Chrome lifecycle. The daemon launches a dedicated Chrome for
@@ -327,6 +332,18 @@ class RealChromeManager implements ChromeManager {
   private async start(): Promise<void> {
     if (this.state === 'stopped') return;
     this.state = 'starting';
+
+    // Warn BEFORE launching, not on failure. With DevTools disabled by policy
+    // Chrome starts perfectly and serves its debug endpoints — the failure only
+    // shows up much later, inside Playwright, as an unreadable `_page` error.
+    // Logging it here means the daemon says what is wrong at startup, which is
+    // also where a customer's installer output will be looked at.
+    try {
+      const reason = await devToolsDisabledReason();
+      if (reason) this.log.error({ fix: DEVTOOLS_POLICY_FIX }, reason);
+    } catch {
+      /* diagnostics must never block a launch */
+    }
 
     // Adopt an existing debug Chrome if one is already listening on our
     // port. Common transition case: an operator who used the old runbook
