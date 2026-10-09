@@ -36,6 +36,11 @@ import type { Browser, BrowserContext, Page } from 'playwright';
  *     default profile.
  * The default is unchanged — bundled Chromium + stealth + fresh profile —
  * so existing agents behave exactly as before.
+ *
+ *   AMBIT_PAGE_TIMEOUT_MS       default ceiling for every Playwright
+ *     operation, in ms (default 60000). Raise it on a slow customer
+ *     machine; an agent that sets its own page-level default still wins.
+ *     See defaultTimeoutMs() below for why this lives here.
  */
 
 const USE_STEALTH = process.env.AMBIT_NO_STEALTH !== '1';
@@ -60,6 +65,10 @@ export interface BrowserHandle {
   context: BrowserContext;
   browser: Browser | null;
   close: () => Promise<void>;
+  /** The default operation ceiling in force for this run, so the caller can
+   *  log it — a timeout is much easier to read when the log says what the
+   *  limit was and which env var moves it. */
+  defaultTimeoutMs: number;
 }
 
 /**
@@ -117,6 +126,47 @@ export interface LaunchOptions {
 
 const missingBinary = (err: unknown): boolean =>
   /Executable doesn't exist|Please run:/.test((err as Error)?.message ?? String(err));
+
+/**
+ * The default ceiling for every Playwright operation the agent performs.
+ *
+ * ── WHY THE CLIENT SETS THIS AND NOT EACH AGENT ──
+ * Playwright's own default is 30s, chosen for CI on a developer's machine.
+ * Our agents run on whatever laptop the customer happens to own, and at
+ * the time of writing exactly ONE agent out of twelve had ever set its own
+ * default — the one that already had a bad night on a slow Windows box.
+ * Every other agent, and every agent not yet written, silently inherited
+ * 30s. That is a machine-speed assumption hiding in a library default, and
+ * the only place it can be fixed once is here.
+ *
+ * ── THE OVERRIDE CONTRACT ──
+ * This is set on the CONTEXT, not the page, for two reasons. A page-level
+ * default would be lost the moment the self-healing proxy replaces a closed
+ * tab (`setDefaultTimeout` binds to the page that existed when it was
+ * called — see SYNC_PAGE_METHODS), whereas a context default is inherited
+ * by every page created later. And Playwright resolves page-level over
+ * context-level, so an agent calling `page.setDefaultTimeout(90_000)` still
+ * wins outright. Agents keep full control; they just no longer have to
+ * remember to take it.
+ *
+ * Read lazily, never as a module-level const: `loadConfig()` merges the
+ * customer's config FILE into `process.env` at runtime, which happens after
+ * this module is imported, so a module-load read would silently ignore a
+ * file-only override. Same trap documented at length in chrome/manager.ts.
+ */
+function defaultTimeoutMs(): number {
+  const n = Number(process.env.AMBIT_PAGE_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 60_000;
+}
+
+/** Apply the default ceiling to a context and report it, so the run log says
+ *  which number was in force when something timed out. */
+function applyDefaultTimeout(context: BrowserContext): number {
+  const ms = defaultTimeoutMs();
+  context.setDefaultTimeout(ms);
+  context.setDefaultNavigationTimeout(ms);
+  return ms;
+}
 
 /**
  * Page methods that return synchronously — they can't await a heal, so
@@ -322,6 +372,7 @@ export async function launchBrowser(
       );
     }
     const context = browser.contexts()[0] ?? (await browser.newContext());
+    const timeoutMs = applyDefaultTimeout(context);
     const picked = await pickStartingPage(context, inputs);
     // This module deliberately does no logging of its own — the caller owns
     // that, same as onPageRecreated.
@@ -331,6 +382,7 @@ export async function launchBrowser(
       page: healed.proxy,
       context,
       browser,
+      defaultTimeoutMs: timeoutMs,
       // Close our tab AND disconnect the CDP client — otherwise the
       // WebSocket to Chrome's debug port lingers until the daemon process
       // exits. Playwright's connectOverCDP implicitly subscribes to
@@ -379,11 +431,13 @@ export async function launchBrowser(
       if (missingBinary(err)) throw new Error(BINARY_HINT);
       throw err;
     }
+    const timeoutMs = applyDefaultTimeout(context);
     const page = context.pages()[0] ?? (await context.newPage());
     return {
       page: selfHealingPage(context, page, onPageRecreated, signal).proxy,
       context,
       browser: context.browser(),
+      defaultTimeoutMs: timeoutMs,
       close: async () => {
         try { await context.close(); } catch { /* ignore */ }
       },
@@ -406,12 +460,14 @@ export async function launchBrowser(
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
   });
+  const timeoutMs = applyDefaultTimeout(context);
   const page = await context.newPage();
 
   return {
     page: selfHealingPage(context, page, onPageRecreated).proxy,
     context,
     browser,
+    defaultTimeoutMs: timeoutMs,
     close: async () => {
       try { await context.close(); } catch { /* ignore */ }
       try { await browser.close(); } catch { /* ignore */ }

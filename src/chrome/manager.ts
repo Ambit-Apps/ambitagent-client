@@ -55,7 +55,6 @@ import {
  */
 
 const BACKOFF_MS = [1_000, 5_000, 30_000, 120_000] as const;
-const HEALTH_STARTUP_TIMEOUT_MS = 30_000;
 const CDP_HEALTH_PATH = '/json/version';
 
 /**
@@ -105,6 +104,26 @@ const healthPingTimeoutMs = () => envInt('AMBIT_CHROME_HEALTH_PING_TIMEOUT_MS', 
  * restarted for the next run.
  */
 const healthMaxFailures = () => envInt('AMBIT_CHROME_HEALTH_MAX_FAILURES', 3);
+
+/**
+ * How long Chrome gets to bind its debug port after launch.
+ *
+ * WHY 90s AND NOT 30s (which is what this was, as a hardcoded const).
+ * The asymmetry here is the whole argument. Too LONG and a genuinely
+ * broken machine takes longer to report a failure it was going to report
+ * anyway. Too SHORT and we SIGKILL a Chrome that was coming up fine —
+ * which then burns the entire restart ladder (1s/5s/30s/2min, 4 attempts)
+ * failing the identical way each time, and reports a port conflict that
+ * isn't there. One costs patience; the other costs the customer their
+ * morning. A first-ever chrome.exe launch behind an on-access antivirus
+ * scan, on a cold profile dir, on the kind of laptop we actually install
+ * on, is realistically north of 30s.
+ *
+ * This is also the reason it's env-tunable now: it sat as a bare `const`
+ * among three knobs that were deliberately made overridable after the
+ * Sept-26 incident, and it is the same class of number as all three.
+ */
+const startupTimeoutMs = () => envInt('AMBIT_CHROME_STARTUP_TIMEOUT_MS', 90_000);
 
 const WELCOME_TAB_HTML = `
 <!doctype html>
@@ -394,6 +413,20 @@ class RealChromeManager implements ChromeManager {
       // memory). Position at top-left for the same predictability.
       '--window-size=1920,1080',
       '--window-position=0,0',
+      // Stop Chrome throttling ITSELF when the customer puts this window
+      // behind another one. Chrome deprioritises background and occluded
+      // windows by design: timers are clamped, rendering can stop
+      // entirely, and raf-driven work stalls. The welcome tab explicitly
+      // invites the customer to treat this as a normal browser, so the
+      // window WILL end up minimised or covered — and then an agent's
+      // perfectly reasonable waits start expiring for a reason that has
+      // nothing to do with the site, the network, or the machine's speed.
+      // These three flags are the standard automation set and remove the
+      // whole category; there is no upside to letting Chrome throttle a
+      // window we are actively driving.
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
     ];
 
     // Optionally force software rendering. On machines whose GPU driver
@@ -489,18 +522,41 @@ class RealChromeManager implements ChromeManager {
     // Wait for CDP to come up. Chrome usually binds the debug port within
     // 500ms - 2s after launch; we poll every 250ms up to the startup
     // timeout, then give up + restart.
+    //
+    // The loop also watches whether the process is still ALIVE, because
+    // "hasn't answered yet" has two completely different causes and the
+    // old deadline-only loop conflated them: a Chrome that died two
+    // seconds in used to be polled at for the remaining 28, and a Chrome
+    // that was merely slow used to be shot at the deadline. Now a real
+    // death restarts immediately and only a live-but-silent Chrome is
+    // allowed to consume the full budget.
     const startedAt = Date.now();
-    while (Date.now() - startedAt < HEALTH_STARTUP_TIMEOUT_MS) {
+    const deadline = startupTimeoutMs();
+    while (Date.now() - startedAt < deadline) {
       if ((this.state as State) === 'stopped') return;
       if (await this.pingCdp()) {
         this.markReady();
         return;
       }
+      // Liveness, but NOT on darwin: there we launch via `/usr/bin/open`,
+      // whose process exits the instant Chrome is handed off, so its exit
+      // code says nothing about Chrome and treating it as death would
+      // abort every single macOS launch. Chrome-death detection on darwin
+      // lives in checkHealth() instead — see the note in the spawn branch.
+      if (!isDarwin && proc.exitCode !== null) {
+        this.log.warn(
+          { exitCode: proc.exitCode, afterMs: Date.now() - startedAt },
+          'managed Chrome exited before it bound the debug port — restarting',
+        );
+        this.scheduleRestart();
+        return;
+      }
       await sleep(250);
     }
     this.log.warn(
-      { timeoutMs: HEALTH_STARTUP_TIMEOUT_MS },
-      'managed Chrome did not respond on debug port — killing and retrying',
+      { timeoutMs: deadline, env: 'AMBIT_CHROME_STARTUP_TIMEOUT_MS' },
+      'managed Chrome stayed alive but never answered on the debug port — killing and retrying. ' +
+        'If this machine is simply slow to launch Chrome, raise AMBIT_CHROME_STARTUP_TIMEOUT_MS.',
     );
     try { proc.kill('SIGKILL'); } catch { /* ignore */ }
     this.scheduleRestart();
@@ -617,11 +673,16 @@ class RealChromeManager implements ChromeManager {
         { attempts: this.restartAttempt },
         'managed Chrome failed too many times consecutively — giving up. ' +
           'Going back to idle; the next agent run will try again with a fresh restart budget. ' +
-          `If this keeps happening, check for another Chrome using port ${this.config.chromePort}.`,
+          'If this keeps happening, the three usual causes are: another Chrome already on port ' +
+          `${this.config.chromePort}; a machine too slow to launch Chrome inside ` +
+          `AMBIT_CHROME_STARTUP_TIMEOUT_MS (currently ${startupTimeoutMs()}ms — raise it); or a GPU ` +
+          'driver killing the renderer (set AMBIT_CHROME_DISABLE_GPU=true). The warning logged on ' +
+          'each attempt above says which.',
       );
       this.rejectPending(new Error(
-        `Managed Chrome crashed ${this.restartAttempt} times in a row. Going idle. ` +
-          `Next agent run will retry. If the pattern repeats, check port ${this.config.chromePort} for conflicts.`,
+        `Managed Chrome failed to start ${this.restartAttempt} times in a row. Going idle; the ` +
+          `next agent run will retry. The per-attempt warnings in the daemon log say whether Chrome ` +
+          `died, never answered, or never launched — check those before changing anything.`,
       ));
       this.goIdle();
       return;

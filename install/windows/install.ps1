@@ -11,8 +11,11 @@
 #     the customer saves both email attachments). No git, no PAT, no
 #     public repo needed.
 #   - Idempotent: re-running upgrades the source in place, restarts the
-#     task, preserves the config file + Chrome profile (customer's
-#     Amazon/LMD logins survive upgrades).
+#     task, and preserves both the Chrome profile (customer's Amazon/LMD
+#     logins survive upgrades) and the config file. "Preserves the config"
+#     means genuinely merges it: installer-owned keys are refreshed, and
+#     every operator-added key -- the per-machine hardening -- is carried
+#     forward verbatim. See Read-ExistingConfig below for why that matters.
 #
 # Usage -- one-time customer flow:
 #
@@ -70,12 +73,81 @@ function Write-Info { param($m) Write-Host "[install] $m" -ForegroundColor Cyan 
 function Write-Warn { param($m) Write-Host "[install] $m" -ForegroundColor Yellow }
 function Write-Fail { param($m) Write-Host "[install] $m" -ForegroundColor Red; exit 1 }
 
+# --- existing config ------------------------------------------------
+# Read the config this machine is ALREADY running before writing a new
+# one, because the per-machine fixes live in there and nowhere else.
+#
+# This script used to build the config from a fixed template and write it
+# unconditionally. Every upgrade therefore silently reverted every
+# hardening we had applied to that laptop -- AMBIT_CHROME_DISABLE_GPU on
+# the machine whose GPU driver kills renderers, a raised health-probe
+# threshold, a raised startup timeout. Those values are the accumulated
+# knowledge of what is wrong with that particular machine, they were
+# usually added during a support call, and an upgrade threw them away
+# without a word. It has already caused one regression in the field.
+#
+# Same parse rules as readSystemConfig() in src/config.ts, so what the
+# installer preserves is exactly what the daemon reads.
+function Read-ExistingConfig {
+    param($Path)
+    $map = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $map }
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $t = $line.Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $eq = $t.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $k = $t.Substring(0, $eq).Trim()
+        $v = $t.Substring($eq + 1).Trim()
+        if ($v.Length -ge 2 -and
+            (($v.StartsWith('"') -and $v.EndsWith('"')) -or
+             ($v.StartsWith("'") -and $v.EndsWith("'")))) {
+            $v = $v.Substring(1, $v.Length - 2)
+        }
+        $map[$k] = $v
+    }
+    return $map
+}
+
+$ExistingConfig = Read-ExistingConfig $ConfigFile
+if ($ExistingConfig.Count -gt 0) {
+    # ASCII only in displayed strings: this file has no BOM, and PowerShell
+    # 5.1 (what Windows Server 2016 / Win10 ship) decodes a BOM-less .ps1 as
+    # Windows-1252, so a UTF-8 em dash here reaches the customer's console as
+    # mojibake. Comments can hold whatever they like; output cannot.
+    Write-Info "Found an existing config with $($ExistingConfig.Count) setting(s) - these will be carried forward."
+}
+
+# Keys this installer owns and rewrites. Everything else in the file was
+# put there by an operator and is carried forward.
+$ManagedKeys = @('ADMIN_URL', 'ENROLLMENT_TOKEN', 'HEADLESS', 'PLAYWRIGHT_BROWSERS_PATH', 'LOG_LEVEL')
+
 # --- config source ---------------------------------------------------
-$AdminUrl        = if ($env:AMBIT_ADMIN_URL)        { $env:AMBIT_ADMIN_URL }        else { '' }
-$EnrollmentToken = if ($env:AMBIT_ENROLLMENT_TOKEN) { $env:AMBIT_ENROLLMENT_TOKEN } else { '' }
-$RunAsUser       = if ($env:AMBIT_RUN_AS_USER)      { $env:AMBIT_RUN_AS_USER }      else { '' }
-$Headless        = if ($env:AMBIT_HEADLESS)         { $env:AMBIT_HEADLESS }         else { 'false' }
-$LogLevel        = if ($env:AMBIT_LOG_LEVEL)        { $env:AMBIT_LOG_LEVEL }        else { 'info' }
+# Precedence: explicit env override > what this machine already had >
+# first-install default. The middle term is the new one, and it is what
+# makes a re-run an upgrade rather than a reset -- an operator who set
+# LOG_LEVEL=debug to chase a problem keeps it, and an upgrade no longer
+# demands the enrollment token be pasted again.
+function Get-ConfigValue {
+    param($Key, $EnvValue, $Default)
+    if ($EnvValue) { return $EnvValue }
+    # A key present but BLANK (`LOG_LEVEL=`, from a half-finished hand edit)
+    # counts as absent, not as an empty answer -- otherwise the blank
+    # propagates into the new config and the daemon reads '' where it
+    # expects a level. Matches the `${VAR:-default}` behaviour on the
+    # Ubuntu side, so both installers resolve identically.
+    if ($ExistingConfig.Contains($Key) -and
+        -not [string]::IsNullOrWhiteSpace([string]$ExistingConfig[$Key])) {
+        return $ExistingConfig[$Key]
+    }
+    return $Default
+}
+
+$AdminUrl        = Get-ConfigValue 'ADMIN_URL'        $env:AMBIT_ADMIN_URL        ''
+$EnrollmentToken = Get-ConfigValue 'ENROLLMENT_TOKEN' $env:AMBIT_ENROLLMENT_TOKEN ''
+$Headless        = Get-ConfigValue 'HEADLESS'         $env:AMBIT_HEADLESS         'false'
+$LogLevel        = Get-ConfigValue 'LOG_LEVEL'        $env:AMBIT_LOG_LEVEL        'info'
+$RunAsUser       = if ($env:AMBIT_RUN_AS_USER)        { $env:AMBIT_RUN_AS_USER }  else { '' }
 
 if (-not $AdminUrl) {
     if ([Environment]::UserInteractive) {
@@ -232,6 +304,24 @@ try {
 # --- config file -----------------------------------------------------
 Write-Info "Writing config to $ConfigFile..."
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+# Carry forward every operator-added key. These are the machine-specific
+# settings (GPU, timeouts, Chrome port/profile) that must outlive an
+# upgrade -- see the note on Read-ExistingConfig above.
+$preservedKeys = @($ExistingConfig.Keys | Where-Object { $ManagedKeys -notcontains $_ })
+$preservedBlock = ''
+if ($preservedKeys.Count -gt 0) {
+    Write-Info "Preserving $($preservedKeys.Count) operator setting(s): $($preservedKeys -join ', ')"
+    $preservedLines = foreach ($k in $preservedKeys) { "$k=$($ExistingConfig[$k])" }
+    $preservedBlock = @"
+
+# --- Preserved from the previous install -----------------------------
+# Added by an operator on this machine, not by the installer. Carried
+# forward on every upgrade. Delete a line here to drop it.
+$($preservedLines -join "`n")
+"@
+}
+
 $configContent = @"
 # Ambit Agent runtime config. Written by install.ps1 at $stamp.
 # The daemon reads this at startup -- see readSystemConfig() in src/config.ts.
@@ -249,6 +339,7 @@ HEADLESS=$Headless
 PLAYWRIGHT_BROWSERS_PATH=$BrowsersDir
 
 LOG_LEVEL=$LogLevel
+$preservedBlock
 "@
 [System.IO.File]::WriteAllText(
     $ConfigFile,

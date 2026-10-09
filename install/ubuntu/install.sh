@@ -31,8 +31,10 @@
 #   # prompts for the two values
 #
 # Re-running is safe — the script is idempotent (creates users only if
-# missing, updates the git checkout in place, rewrites config atomically,
-# reloads systemd).
+# missing, updates the git checkout in place, merges + rewrites config
+# atomically, reloads systemd). "Merges" is load-bearing: operator-added
+# keys such as AMBIT_CHROME_DISABLE_GPU survive an upgrade instead of
+# being overwritten by the template.
 #
 # --------------------------------------------------------------------
 # Overridable env vars (rarely needed):
@@ -77,9 +79,62 @@ else
   warn "/etc/os-release missing — proceeding but OS detection skipped."
 fi
 
+# ─── existing config ─────────────────────────────────────────────────
+# Read the config this machine is ALREADY running before writing a new
+# one. The per-machine fixes live in there and nowhere else: this script
+# used to build the file from a fixed template and overwrite it, so every
+# upgrade silently reverted the hardening applied to that box
+# (AMBIT_CHROME_DISABLE_GPU, raised health/startup timeouts, a non-default
+# Chrome port). Those settings are what we learned about that machine,
+# usually during a support call. Parse rules match readSystemConfig() in
+# src/config.ts so what we preserve is exactly what the daemon reads.
+#
+# Keys the installer owns and rewrites; everything else is operator-added
+# and carried forward verbatim.
+readonly MANAGED_KEYS=" ADMIN_URL ENROLLMENT_TOKEN HEADLESS PLAYWRIGHT_BROWSERS_PATH LOG_LEVEL "
+
+# existing_value KEY → prints the previous value, or nothing.
+existing_value() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$/\1/p" "$CONFIG_FILE" \
+    | tail -n1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/"
+}
+
+# Lines to append: every previous key that is not installer-owned.
+#
+# Re-emitted as a normalised KEY=value rather than copied verbatim, so the
+# preserved line is exactly what readSystemConfig() in src/config.ts will
+# read back (it trims both sides of the '='). A hand-edited `  KEY = v `
+# therefore comes out canonical, which also keeps it valid for systemd's
+# stricter EnvironmentFile parser.
+preserved_block() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local line key value
+  # `|| [[ -n "$line" ]]` so the final line is still emitted when the file
+  # has no trailing newline — otherwise an operator whose editor omits one
+  # silently loses their last setting on every upgrade.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//')" == '#'* ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]')"
+    [[ -n "$key" ]] || continue
+    [[ "$MANAGED_KEYS" == *" $key "* ]] && continue
+    value="$(printf '%s' "${line#*=}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
+    printf '%s=%s\n' "$key" "$value"
+  done < "$CONFIG_FILE"
+}
+
+PRESERVED="$(preserved_block)"
+if [[ -n "$PRESERVED" ]]; then
+  log "Preserving operator settings: $(printf '%s' "$PRESERVED" | cut -d= -f1 | paste -sd, -)"
+fi
+
 # ─── config source ───────────────────────────────────────────────────
-ADMIN_URL="${AMBIT_ADMIN_URL:-${1:-}}"
-ENROLLMENT_TOKEN="${AMBIT_ENROLLMENT_TOKEN:-${2:-}}"
+# Precedence: explicit override > what this machine already had > default.
+# The middle term makes a re-run an upgrade rather than a reset.
+ADMIN_URL="${AMBIT_ADMIN_URL:-${1:-$(existing_value ADMIN_URL)}}"
+ENROLLMENT_TOKEN="${AMBIT_ENROLLMENT_TOKEN:-${2:-$(existing_value ENROLLMENT_TOKEN)}}"
 
 if [[ -z "$ADMIN_URL" ]]; then
   if [[ -t 0 ]]; then
@@ -99,8 +154,10 @@ fi
 
 CLIENT_GIT_URL="${AMBIT_CLIENT_GIT_URL:-$DEFAULT_GIT_URL}"
 CLIENT_REF="${AMBIT_CLIENT_REF:-$DEFAULT_GIT_REF}"
-HEADLESS="${AMBIT_HEADLESS:-true}"
-LOG_LEVEL="${AMBIT_LOG_LEVEL:-info}"
+HEADLESS="${AMBIT_HEADLESS:-$(existing_value HEADLESS)}"
+HEADLESS="${HEADLESS:-true}"
+LOG_LEVEL="${AMBIT_LOG_LEVEL:-$(existing_value LOG_LEVEL)}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # ─── base packages ───────────────────────────────────────────────────
 log "Refreshing apt index…"
@@ -200,6 +257,12 @@ HEADLESS=$HEADLESS
 PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR
 
 LOG_LEVEL=$LOG_LEVEL
+${PRESERVED:+
+# --- Preserved from the previous install -----------------------------
+# Added by an operator on this machine, not by the installer. Carried
+# forward on every upgrade. Delete a line here to drop it.
+$PRESERVED
+}
 EOF
 chown root:"$SERVICE_USER" "$CONFIG_FILE.tmp"
 chmod 0640 "$CONFIG_FILE.tmp"
