@@ -761,11 +761,25 @@ function createRuntimeCtx({
       },
     },
 
-    async uploadFile(buf: Uint8Array, name: string, mimeType?: string): Promise<string> {
+    async uploadFile(
+      buf: Uint8Array,
+      name: string,
+      mimeType?: string,
+      opts?: { kind?: 'result' | 'diagnostic' },
+    ): Promise<string> {
       const mime = mimeType ?? guessMime(name);
-      // Always a result: uploadFile is how a script hands over the thing
-      // the run was for. Never swept.
-      return uploadArtifact(buf, name.slice(0, 255) || 'artifact.bin', mime.slice(0, 128), undefined, 'result');
+      // Defaults to `result` — uploadFile is normally how a script hands
+      // over the thing the run was for. An agent passes `diagnostic` for
+      // things nobody ordered: DOM inspect dumps go through uploadFile
+      // only because there is no other way to save a JSON blob, and
+      // storing those forever is how a database ends up 98.6% exhaust.
+      return uploadArtifact(
+        buf,
+        name.slice(0, 255) || 'artifact.bin',
+        mime.slice(0, 128),
+        undefined,
+        opts?.kind === 'diagnostic' ? 'diagnostic' : 'result',
+      );
     },
 
     // Input files the run was triggered with (e.g. the item photo the
