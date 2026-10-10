@@ -241,6 +241,14 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
             signal,
           });
 
+          // Say which ceiling is in force. A "Timeout 60000ms exceeded" in a
+          // customer's log is far more actionable when the line above it
+          // names the knob that moves it.
+          log.info(
+            { runId: msg.runId, defaultTimeoutMs: browser.defaultTimeoutMs, env: 'AMBIT_PAGE_TIMEOUT_MS' },
+            'default page timeout applied for this run',
+          );
+
           // Cancel → close the browser now. Any in-flight Playwright op
           // (goto, click, waitFor…) rejects with "Target has been closed",
           // which the script's own try/catch surfaces up to our catch
