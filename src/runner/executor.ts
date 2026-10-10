@@ -283,6 +283,9 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
           log,
           config,
           signal,
+          // Only an explicit false disables capture — agents uploaded
+          // before the flag existed keep their screenshots.
+          allowScreenshots: msg.browser?.allow_screenshots !== false,
         });
 
         // Promise.race the script against the abort signal. The script
@@ -436,6 +439,7 @@ function createRuntimeCtx({
   log,
   config,
   signal,
+  allowScreenshots,
 }: {
   runState: { sawOutcome: boolean };
   runId: string;
@@ -446,6 +450,13 @@ function createRuntimeCtx({
   log: Logger;
   config: ExecutorConfig;
   signal?: AbortSignal;
+  /**
+   * False only when the agent's manifest says `browser.allow_screenshots:
+   * false`. Enforced HERE rather than trusted to the script, so a
+   * clinical agent physically cannot ship an image off the customer's
+   * machine even if someone later adds a capture call.
+   */
+  allowScreenshots: boolean;
 }) {
   // Post-cancel: silently drop event emissions. The executor has
   // already returned via Promise.race, so admin's terminal-run guard
@@ -459,7 +470,13 @@ function createRuntimeCtx({
         rawEmit(event);
       }
     : rawEmit;
-  const uploadArtifact = (buf: Uint8Array, name: string, mimeType: string, label?: string) => {
+  const uploadArtifact = (
+    buf: Uint8Array,
+    name: string,
+    mimeType: string,
+    label: string | undefined,
+    artifactKind: 'result' | 'diagnostic',
+  ) => {
     const b64 = Buffer.from(buf).toString('base64');
     emit({
       type: 'run_event',
@@ -472,6 +489,10 @@ function createRuntimeCtx({
         size_bytes: buf.byteLength,
         contents_b64: b64,
         label,
+        // What the admin uses to decide whether these bytes may ever be
+        // reclaimed. A result is the run's product and is kept; a
+        // diagnostic is exhaust and is dropped once the run succeeds.
+        artifact_kind: artifactKind,
       },
     });
     // The URL is minted server-side after insert; the runtime doesn't
@@ -740,9 +761,25 @@ function createRuntimeCtx({
       },
     },
 
-    async uploadFile(buf: Uint8Array, name: string, mimeType?: string): Promise<string> {
+    async uploadFile(
+      buf: Uint8Array,
+      name: string,
+      mimeType?: string,
+      opts?: { kind?: 'result' | 'diagnostic' },
+    ): Promise<string> {
       const mime = mimeType ?? guessMime(name);
-      return uploadArtifact(buf, name.slice(0, 255) || 'artifact.bin', mime.slice(0, 128));
+      // Defaults to `result` — uploadFile is normally how a script hands
+      // over the thing the run was for. An agent passes `diagnostic` for
+      // things nobody ordered: DOM inspect dumps go through uploadFile
+      // only because there is no other way to save a JSON blob, and
+      // storing those forever is how a database ends up 98.6% exhaust.
+      return uploadArtifact(
+        buf,
+        name.slice(0, 255) || 'artifact.bin',
+        mime.slice(0, 128),
+        undefined,
+        opts?.kind === 'diagnostic' ? 'diagnostic' : 'result',
+      );
     },
 
     // Input files the run was triggered with (e.g. the item photo the
@@ -921,6 +958,25 @@ function createRuntimeCtx({
     page,
     uploadScreenshot: page
       ? async (buf: Uint8Array, label: string): Promise<string> => {
+          // The PHI guard. Refused here, in the runtime, so the bytes
+          // never leave this machine — the script cannot talk its way
+          // past a manifest flag. Returns a marker rather than throwing:
+          // a capture is never the point of a run, and failing the whole
+          // thing because a screenshot was declined would be worse than
+          // the screenshot being missing.
+          if (!allowScreenshots) {
+            emit({
+              type: 'run_event',
+              runId,
+              kind: 'log',
+              ts: nowTs(),
+              payload: {
+                message: 'screenshot not captured — this agent has image capture disabled',
+                label,
+              },
+            });
+            return 'artifact:screenshot-disabled';
+          }
           const safeLabel = String(label ?? 'screenshot').replace(/[^a-z0-9_-]+/gi, '-');
           // Detect the format from the bytes rather than assuming PNG.
           // Agents may screenshot as JPEG (much smaller — artifacts are
@@ -929,7 +985,7 @@ function createRuntimeCtx({
           const isJpeg = buf.length > 2 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
           const ext = isJpeg ? 'jpg' : 'png';
           const mime = isJpeg ? 'image/jpeg' : 'image/png';
-          return uploadArtifact(buf, `${safeLabel}.${ext}`, mime, safeLabel);
+          return uploadArtifact(buf, `${safeLabel}.${ext}`, mime, safeLabel, 'diagnostic');
         }
       : undefined,
   };

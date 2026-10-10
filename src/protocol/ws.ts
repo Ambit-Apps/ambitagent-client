@@ -82,6 +82,12 @@ export interface ArtifactPayload {
   contents_b64: string;
   /** Optional label — used for screenshots to indicate the moment captured. */
   label?: string;
+  /**
+   * result     — the run's product (ctx.uploadFile). Kept.
+   * diagnostic — exhaust (ctx.uploadScreenshot). Bytes reclaimed by the
+   *              admin once the run has succeeded.
+   */
+  artifact_kind?: 'result' | 'diagnostic';
 }
 
 // Admin → Runtime messages
@@ -109,6 +115,17 @@ export interface BrowserSpec {
   model: 'attached_chrome' | 'chromium';
   required_extensions?: string[];
   required_logins?: string[];
+  /**
+   * Whether this agent may upload screenshots at all. Defaults to true;
+   * only an explicit false disables them.
+   *
+   * Enforced in the runtime (see createRuntimeCtx), so the bytes never
+   * leave the customer's machine. The ECW agent already avoids PHI in
+   * images by convention — one capture, deliberately pre-patient — and
+   * this turns that convention into something the next author cannot
+   * accidentally undo.
+   */
+  allow_screenshots?: boolean;
 }
 
 export interface RunTaskMessage {
