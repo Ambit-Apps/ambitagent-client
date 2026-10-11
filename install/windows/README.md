@@ -6,11 +6,26 @@ sends a `run_task`, then launches a managed Chrome window on the
 customer's desktop for headful browser agents (e.g. driver-wave-assignment
 which uses `browser.model: "attached_chrome"`).
 
-Distribution is via email attachment — no public repo, no PAT, no git.
-The customer receives four files, saves them into a single folder, and
-**double-clicks `install.bat`**. That wrapper self-elevates, clears the
-"downloaded from the internet" block, and runs `install.ps1` — so the
-customer never has to open PowerShell or type any commands.
+Distribution is **a staff-only download from the portal** — no public
+repo, no PAT, no git.
+
+Gmail blocks `.bat` and `.ps1`, inspects inside archives, and will not
+carry them even zipped. It does not block links. So staff downloads the
+bundle from `/staff/runtimes` (per runtime, with that machine's admin URL
+already filled in), gets it onto the customer's machine, and runs it
+there. The old route — upload to Google Drive, sign into Drive on the
+customer's box, download — is retired.
+
+Staff performs the installs. The download button lives under `/staff`,
+behind `staffOnlyGuard` client-side and a staff check server-side, so a
+customer never sees it. That stays true until there is a signed,
+official Windows installer worth handing to end users.
+
+Nothing about the install itself changed: the customer's machine still
+gets the same four files in one folder, and the operator still
+**double-clicks `install.bat`** (or right-click → Run as administrator).
+That wrapper self-elevates, clears the "downloaded from the internet"
+block, and runs `install.ps1`.
 
 ## Why Task Scheduler (not a Windows service)
 
@@ -27,8 +42,20 @@ CG Logistics.
 
 ## What you (staff) ship
 
-Four files, all attached to one email. The customer saves all four
-into the same folder (typically Downloads).
+One zip from the portal, containing the four files below. Extract them
+all into the same folder (typically Downloads) on the customer's machine.
+
+To publish a new build so it appears there, from the client repo root:
+
+```bash
+node install/publish-release.mjs --admin https://ambitagent-prod.herokuapp.com
+```
+
+That builds the zip (refusing if the tree is dirty, so the SHA in the
+version is honest) and uploads it. The version string — `<stamp>-<sha>` —
+is the same one `build-info.json` carries inside the bundle and the same
+one a running daemon reports in the portal's Version column, so "is this
+machine on the build I shipped?" is a visual match.
 
 | File | Source | Notes |
 |---|---|---|
@@ -37,12 +64,22 @@ into the same folder (typically Downloads).
 | `run-daemon.ps1` | `install/windows/run-daemon.ps1` in this repo | Same file for every customer. |
 | `ambitagent-client-<stamp>-<sha>.zip` | Produced by `install/build-installer-zip.sh` | Rebuilt on every client version bump. |
 
-Plus in the email body:
+Plus, for a FIRST install on a machine:
 
 - The **enrollment token** — generated in the portal at
   `/staff/runtimes` → **+ Enroll runtime**. Shown once; copy immediately.
-- The **admin URL** — your Heroku prod app URL, e.g.
-  `https://ambitagent-prod.herokuapp.com`.
+  `install.ps1` prompts for it.
+
+The **admin URL** is already baked into the downloaded `install.bat`, so
+there is no prompt for it.
+
+### Re-running the installer on a machine that already has it
+
+An upgrade needs **no token**. `install.ps1` resolves config
+`env → existing config file → prompt`, so a machine that is already
+enrolled reuses the token sitting in its config and never asks. Download
+the current installer, run it, done — the runtime keeps its identity and
+its history.
 
 ## Building the zip
 

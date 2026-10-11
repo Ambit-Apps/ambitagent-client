@@ -1,7 +1,52 @@
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * Which build this actually is.
+ *
+ * ── WHY NOT npm_package_version ──
+ * It used to be `process.env.npm_package_version ?? '0.0.0'`. npm sets
+ * that variable ONLY when npm launches the process, and run-daemon.ps1
+ * invokes `node` directly — so on every Task Scheduler install it was
+ * undefined and the daemon reported the fallback. Three production
+ * runtimes all reported "0.0.0", the portal rendered it in a column
+ * headed Version, and it looked like data. The one machine showing
+ * "0.0.1" was a laptop started with an npm script, reading a
+ * package.json version that has not been bumped in the project's life.
+ *
+ * So the number was never wrong in a way anyone could notice, which is
+ * the worst kind of wrong: an update feature that says "update this
+ * machine to v12" is meaningless when every machine claims 0.0.0.
+ *
+ * `build-info.json` is written INTO the bundle by
+ * install/build-installer-zip.sh and carries the same string as the zip
+ * filename, so a runtime on screen matches a file that was shipped.
+ *
+ * ── WHY 'unknown' AND NOT '0.0.0' ──
+ * A fallback that looks like a version is exactly how this hid for
+ * months. Something that cannot identify itself should say so.
+ */
+function resolveBuildVersion(): string {
+  // dist/config.js at runtime, src/config.ts under tsx — build-info.json
+  // sits at the package root in both cases, one level up.
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [join(here, '..', 'build-info.json'), join(here, 'build-info.json')]) {
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, 'utf8')) as { version?: unknown };
+      if (typeof parsed.version === 'string' && parsed.version.trim()) {
+        return parsed.version.trim();
+      }
+    } catch {
+      /* not this path — try the next */
+    }
+  }
+  // A dev machine running via npm still gets something useful.
+  const fromNpm = process.env.npm_package_version;
+  return fromNpm ? `${fromNpm}-dev` : 'unknown';
+}
 
 /**
  * Runtime daemon config. Two sources, in priority order:
@@ -155,7 +200,7 @@ export function loadConfig(): Config {
     // Not persisted server-side yet — the admin resolves runtimeId via
     // the enrollment token hash. This is just for correlation in logs.
     runtimeId: optional('RUNTIME_ID', fileConfig, `runtime-${process.pid}`),
-    version: process.env.npm_package_version ?? '0.0.0',
+    version: resolveBuildVersion(),
     heartbeatIntervalMs: Number(optional('HEARTBEAT_INTERVAL_MS', fileConfig, '15000')),
     reconnectMinDelayMs: Number(optional('RECONNECT_MIN_DELAY_MS', fileConfig, '1000')),
     reconnectMaxDelayMs: Number(optional('RECONNECT_MAX_DELAY_MS', fileConfig, '30000')),
