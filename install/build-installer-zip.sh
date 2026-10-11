@@ -139,14 +139,17 @@ SIZE=$(du -h "$OUT_PATH" | awk '{print $1}')
 echo ""
 echo "Built:  $OUT_PATH  ($SIZE)"
 echo ""
-echo "Send these four attachments to the customer:"
-echo "  1. $OUT_PATH"
-echo "  2. install/windows/install.bat"
-echo "  3. install/windows/install.ps1"
-echo "  4. install/windows/run-daemon.ps1"
+# This script only BUILDS. Publishing is install/publish-release.mjs,
+# which calls this and then uploads — so most of the time you want that
+# instead and will never read the lines below.
+#
+# The old epilogue here told you to email four attachments. Gmail blocks
+# .bat and .ps1 and inspects inside archives, which is how distribution
+# became a round-trip through Google Drive. Saying so in the tool's own
+# output was actively sending people down that path.
+echo "Built. To publish it so staff can download it from the portal:"
 echo ""
-echo "Also include in the email body:"
-echo "  - Enrollment token (from portal /staff/runtimes → + Enroll runtime)"
-echo "  - Your prod ADMIN_URL (Heroku app URL)"
-echo "  - Instructions: 'save all four files into the same folder, then"
-echo "    double-click install.bat and click Yes on the prompts'"
+echo "  node install/publish-release.mjs --admin <your admin API URL>"
+echo ""
+echo "That runs this build again and uploads the result. The admin API URL"
+echo "is the PUBLIC_API_URL value, not the portal address."

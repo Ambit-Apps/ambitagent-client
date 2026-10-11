@@ -56,15 +56,33 @@ function resolveBuildVersion(): string {
  *    drops on customer machines. Env vars still override.
  *      - Linux:   /etc/ambit-agent/config
  *      - Windows: %ProgramData%\Ambit Agent\config
+ *      - macOS:   ~/Library/Application Support/Ambit Agent/config
  *
  * Both `ADMIN_URL` and `ENROLLMENT_TOKEN` are required; startup fails
  * loudly if either is missing.
  */
 
-const SYSTEM_CONFIG_PATH =
+/**
+ * Where the installer dropped the config.
+ *
+ * macOS is under ~/Library rather than /etc, and that is not cosmetic:
+ * the agent runs as a launchd LaunchAgent, which is per-user by
+ * definition, so a root-owned /etc config paired with a user-owned agent
+ * would be a split-brain. Keeping both in the user's own tree is also
+ * what lets the whole macOS install run WITHOUT sudo.
+ *
+ * /etc/ambit-agent/config is still checked on macOS, second, so a
+ * machine set up by hand before the installer existed keeps working.
+ */
+const SYSTEM_CONFIG_PATHS: string[] =
   process.platform === 'win32'
-    ? join(process.env.ProgramData ?? 'C:\\ProgramData', 'Ambit Agent', 'config')
-    : '/etc/ambit-agent/config';
+    ? [join(process.env.ProgramData ?? 'C:\\ProgramData', 'Ambit Agent', 'config')]
+    : process.platform === 'darwin'
+      ? [
+          join(homedir(), 'Library', 'Application Support', 'Ambit Agent', 'config'),
+          '/etc/ambit-agent/config',
+        ]
+      : ['/etc/ambit-agent/config'];
 
 export interface Config {
   adminUrl: string;        // e.g. http://localhost:3100 (dev) or https://api.ambitagent.com (prod)
@@ -117,9 +135,24 @@ export interface Config {
   chromeDisableGpu: boolean;
 }
 
+/** The first config path that exists, for error messages. */
+function configPathHint(): string {
+  return SYSTEM_CONFIG_PATHS[0] ?? '/etc/ambit-agent/config';
+}
+
 function readSystemConfig(): Record<string, string> {
+  // First path that parses wins. On macOS that is the per-user file,
+  // with /etc as the fallback for machines set up before the installer.
+  for (const path of SYSTEM_CONFIG_PATHS) {
+    const parsed = readOneConfig(path);
+    if (parsed) return parsed;
+  }
+  return {};
+}
+
+function readOneConfig(path: string): Record<string, string> | null {
   try {
-    const raw = readFileSync(SYSTEM_CONFIG_PATH, 'utf8');
+    const raw = readFileSync(path, 'utf8');
     const out: Record<string, string> = {};
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
@@ -136,22 +169,50 @@ function readSystemConfig(): Record<string, string> {
     }
     return out;
   } catch {
-    // File missing / unreadable — fine on dev machines. Env vars carry the load.
-    return {};
+    // NULL, not {}. An empty object is truthy, so returning one here
+    // would make readSystemConfig stop at the first path and never try
+    // the /etc fallback — the fallback would exist and never run.
+    //
+    // Missing is also fine in itself: on a dev machine there is no
+    // config file and env vars carry the load.
+    return null;
   }
 }
 
+/**
+ * A blank env var counts as ABSENT, not as an empty answer.
+ *
+ * `process.env[name] ?? fallback[name]` looks right and is not: `??`
+ * only falls through on null/undefined, so an exported-but-empty
+ * ADMIN_URL ('' from `export ADMIN_URL=` or a shell var that did not
+ * expand) wins over a perfectly good config file, and the daemon exits
+ * reporting the value as MISSING while it is sitting right there on
+ * disk.
+ *
+ * Both installers already treat a present-but-blank key as absent —
+ * Get-ConfigValue on Windows says so explicitly. The daemon disagreeing
+ * with its own installers is the kind of difference nobody finds until
+ * it costs an afternoon.
+ */
+function fromEnvOrFile(name: string, fallback: Record<string, string>): string | undefined {
+  const env = process.env[name];
+  if (env !== undefined && env.trim() !== '') return env;
+  const file = fallback[name];
+  if (file !== undefined && file.trim() !== '') return file;
+  return undefined;
+}
+
 function require(name: string, fallback: Record<string, string>): string {
-  const v = process.env[name] ?? fallback[name];
+  const v = fromEnvOrFile(name, fallback);
   if (!v) {
-    console.error(`Missing required config: ${name}. Set it via env var or ${SYSTEM_CONFIG_PATH}.`);
+    console.error(`Missing required config: ${name}. Set it via env var or ${configPathHint()}.`);
     process.exit(1);
   }
   return v;
 }
 
 function optional(name: string, fallback: Record<string, string>, def: string): string {
-  return process.env[name] ?? fallback[name] ?? def;
+  return fromEnvOrFile(name, fallback) ?? def;
 }
 
 function deriveWsUrl(adminUrl: string): string {
