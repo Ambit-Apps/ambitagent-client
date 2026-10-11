@@ -85,20 +85,33 @@ if (/-dirty$/.test(version)) {
   process.exit(1);
 }
 
+// One release spans both platforms. `common` is the source zip — the
+// daemon is the same code either way, and only the install scripts
+// differ. Publishing per-platform would let the two drift a commit
+// apart with nothing on screen to show it.
 const files = [
-  { path: 'install.bat', from: join(ROOT, 'install/windows/install.bat') },
-  { path: 'install.ps1', from: join(ROOT, 'install/windows/install.ps1') },
-  { path: 'run-daemon.ps1', from: join(ROOT, 'install/windows/run-daemon.ps1') },
-  { path: zipName, from: join(distDir, zipName) },
+  { platform: 'common', path: zipName, from: join(distDir, zipName) },
+  { platform: 'windows', path: 'install.bat', from: join(ROOT, 'install/windows/install.bat') },
+  { platform: 'windows', path: 'install.ps1', from: join(ROOT, 'install/windows/install.ps1') },
+  { platform: 'windows', path: 'run-daemon.ps1', from: join(ROOT, 'install/windows/run-daemon.ps1') },
+  { platform: 'macos', path: 'install.sh', from: join(ROOT, 'install/macos/install.sh') },
+  { platform: 'macos', path: 'uninstall.sh', from: join(ROOT, 'install/macos/uninstall.sh') },
 ].map((f) => {
   const buf = readFileSync(f.from);
-  return { path: f.path, contents_b64: buf.toString('base64'), bytes: buf.byteLength };
+  return {
+    platform: f.platform,
+    path: f.path,
+    contents_b64: buf.toString('base64'),
+    bytes: buf.byteLength,
+  };
 });
 
 const total = files.reduce((n, f) => n + f.bytes, 0);
 console.log(`\nRelease ${version}`);
-for (const f of files) console.log(`  ${f.path.padEnd(42)} ${(f.bytes / 1024).toFixed(1)} KB`);
-console.log(`  ${'total'.padEnd(42)} ${(total / 1024).toFixed(1)} KB`);
+for (const f of files) {
+  console.log(`  ${f.platform.padEnd(8)} ${f.path.padEnd(42)} ${(f.bytes / 1024).toFixed(1)} KB`);
+}
+console.log(`  ${''.padEnd(8)} ${'total'.padEnd(42)} ${(total / 1024).toFixed(1)} KB`);
 
 if (DRY) {
   console.log(`\nDry run — nothing uploaded. Would POST to ${adminUrl}/rest/client-releases`);
@@ -112,7 +125,7 @@ const res = await fetch(`${adminUrl}/rest/client-releases`, {
   body: JSON.stringify({
     version,
     notes: notes || null,
-    files: files.map(({ path, contents_b64 }) => ({ path, contents_b64 })),
+    files: files.map(({ path, contents_b64, platform }) => ({ path, contents_b64, platform })),
   }),
 });
 
