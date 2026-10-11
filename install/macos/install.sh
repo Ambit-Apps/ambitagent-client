@@ -96,6 +96,21 @@ info "Source bundle: $(basename "$SRC_ZIP")"
 # Precedence matches install.ps1's Get-ConfigValue exactly, which is what
 # makes an UPGRADE need no enrollment token: the value already in the
 # config file is reused when no env var overrides it.
+# Trim with parameter expansion, NOT `echo | xargs`.
+#
+# xargs looks like a tidy trim and is a word-splitter that also
+# interprets quotes and backslashes: it would strip the quotes off
+# VALUE="x", and die outright on a value containing an apostrophe
+# ("unterminated quote"). Config values are mostly hex tokens and URLs,
+# but an operator-added key only has to contain one apostrophe once to
+# break an install, and the failure would point at nothing useful.
+trim() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"   # leading
+  v="${v%"${v##*[![:space:]]}"}"   # trailing
+  printf '%s' "$v"
+}
+
 declare -a EXISTING_KEYS=()
 declare -a EXISTING_VALS=()
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -104,8 +119,11 @@ if [[ -f "$CONFIG_FILE" ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    # No '=' is not a setting. config.ts skips these too; parsing them
+    # would invent a key whose name is the whole line.
+    [[ "$line" == *"="* ]] || continue
     key="${line%%=*}"; val="${line#*=}"
-    key="$(echo "$key" | xargs)"; val="$(echo "$val" | xargs)"
+    key="$(trim "$key")"; val="$(trim "$val")"
     [[ -n "$key" ]] || continue
     EXISTING_KEYS+=("$key"); EXISTING_VALS+=("$val")
   done < "$CONFIG_FILE"
