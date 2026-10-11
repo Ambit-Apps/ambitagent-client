@@ -24,6 +24,10 @@
  * running daemon reports. One identity, derived in one place: if the
  * portal says a machine is on 20261011-114857-3aea35a, that is the file
  * that was installed on it.
+ *
+ * --admin is the ADMIN API url (the PUBLIC_API_URL value), not the portal
+ * address. They are different hosts, and the installer bakes the API one
+ * into install.bat so the daemon knows where to enroll.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -125,4 +129,5 @@ if (!res.ok) {
 }
 
 console.log(`\nPublished ${version} to ${adminUrl}.`);
-console.log('Staff can now download it per-runtime from /staff/runtimes.');
+console.log(`Staff can now download it at ${adminUrl}/staff/install — open that ON the`);
+console.log('customer\'s machine, sign in, download, and run install.bat as administrator.');
