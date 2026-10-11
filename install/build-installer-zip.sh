@@ -64,17 +64,49 @@ OUT_PATH="${OUT_DIR}/${OUT_NAME}"
 mkdir -p "$OUT_DIR"
 rm -f "$OUT_PATH"
 
+# ── The build's identity, written INTO the payload ──
+#
+# This stamp and SHA were already computed for the filename, and only for
+# the filename — so an installed client had no way to know what it was.
+# config.ts fell back to `npm_package_version`, which npm only sets when
+# npm launches the process; run-daemon.ps1 invokes `node` directly, so on
+# every Task Scheduler install that variable was undefined and the runtime
+# reported the hardcoded fallback '0.0.0'. Three production machines all
+# claimed the same non-version, and the portal showed it as though it were
+# data.
+#
+# The string written here is IDENTICAL to the one in the zip filename, so
+# a runtime on screen can be matched by eye to a file that was actually
+# shipped. Derived, never remembered — it cannot drift the way a
+# hand-bumped package.json version did (it read 0.0.1 across every
+# release this project has ever made).
+BUILD_INFO="build-info.json"
+cat > "$BUILD_INFO" <<EOF
+{
+  "version": "${STAMP}-${SHA}${DIRTY_TAG}",
+  "stamp": "${STAMP}",
+  "sha": "${SHA}",
+  "built_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+}
+EOF
+# Remove it from the working tree afterwards — it is a build artifact, not
+# a source file, and a stale one lying around would be reported as the
+# running version by a dev-mode daemon.
+trap 'rm -f "$BUILD_INFO"' EXIT
+
 # Contents shipped to the customer. Kept intentionally minimal:
 #   - src/               source the customer builds with tsc
 #   - package.json       declares dependencies
 #   - package-lock.json  locks dep versions (npm ci refuses to run without)
 #   - tsconfig.json      TypeScript build config
+#   - build-info.json    what this build IS — see above
 #   - README.md          nice to have if the customer explores the extracted tree
 INCLUDES=(
     src
     package.json
     package-lock.json
     tsconfig.json
+    "$BUILD_INFO"
 )
 [[ -f README.md ]] && INCLUDES+=(README.md)
 
