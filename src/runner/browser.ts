@@ -2,6 +2,7 @@ import { chromium } from 'playwright-extra';
 import { chromium as pwChromium } from 'playwright';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { Browser, BrowserContext, Page } from 'playwright';
+import { DEVTOOLS_POLICY_FIX, devToolsPolicyState } from '../chrome/detect.js';
 
 /**
  * Playwright + stealth launcher — MUST stay in sync with
@@ -371,6 +372,25 @@ export async function launchBrowser(
           `(${(err as Error)?.message ?? err})`,
       );
     }
+    // ── FAIL HERE, NOT FOUR LINES DOWN ──
+    // With DevTools disabled by policy, everything above this point
+    // SUCCEEDS: Chrome starts, serves its debug endpoints, and accepts the
+    // CDP connection. Playwright's target map is never populated, so the
+    // run dies inside pickStartingPage with "Cannot read properties of
+    // undefined (reading '_page')" — an error that names nothing you can
+    // act on and cost two hours to diagnose the first time, then reached a
+    // customer anyway because the daemon only logged the real reason to its
+    // own log file at startup.
+    //
+    // The check runs per-RUN rather than per-daemon-start on purpose: the
+    // policy can be re-applied by a plug-in reinstall or a policy refresh
+    // long after the daemon came up, and the run is where someone is
+    // actually watching.
+    const policy = await devToolsPolicyState();
+    if (policy.blocked) {
+      throw new Error(`${policy.reason} Fix: ${DEVTOOLS_POLICY_FIX}`);
+    }
+
     const context = browser.contexts()[0] ?? (await browser.newContext());
     const timeoutMs = applyDefaultTimeout(context);
     const picked = await pickStartingPage(context, inputs);

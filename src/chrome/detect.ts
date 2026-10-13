@@ -109,14 +109,59 @@ function linuxPaths(): string[] {
  * the overwhelmingly common case is no policy at all.
  */
 export async function devToolsDisabledReason(): Promise<string | null> {
+  return (await devToolsPolicyState()).reason;
+}
+
+/**
+ * Where a DevTools policy was found, so a repair can target the SAME place.
+ *
+ * Scope matters more than it looks. On macOS the eCW plug-in writes to the
+ * user's own `com.google.Chrome` preferences, and the Windows analogue is
+ * HKCU — which means the usual repair needs no administrator at all. Writing
+ * HKLM would also work (machine policy outranks user policy) but it relaxes
+ * the setting for every account on a shared clinical workstation to fix one.
+ * So: repair where it was set, and only widen when we have to.
+ */
+export interface DevToolsPolicyState {
+  /** True when Chrome will refuse debugger attachment. */
+  blocked: boolean;
+  /** 'DeveloperToolsAvailability' | 'DeveloperToolsDisabled', or null. */
+  key: string | null;
+  /** The offending value, as a decimal string. */
+  value: string | null;
+  /** Machine-readable target for a repair. */
+  scope: 'HKLM' | 'HKCU' | 'defaults' | null;
+  /** Human-readable location, for logs and prompts. */
+  where: string | null;
+  /** The full explanation, or null when nothing is wrong. */
+  reason: string | null;
+}
+
+const NOT_BLOCKED: DevToolsPolicyState = {
+  blocked: false, key: null, value: null, scope: null, where: null, reason: null,
+};
+
+export async function devToolsPolicyState(): Promise<DevToolsPolicyState> {
   const { promisify } = await import('node:util');
   const exec = promisify((await import('node:child_process')).exec);
 
-  const disabled = (key: string, value: string, where: string): string =>
-    `Chrome's DevTools are disabled by policy (${key}=${value}, set in ${where}). ` +
-    `Chrome refuses debugger attachment while this is set, so browser agents ` +
-    `cannot run. This policy is commonly installed by the eClinicalWorks ` +
-    `plug-in, and it applies to ALL sites, not just the EMR.`;
+  const disabled = (
+    key: string,
+    value: string,
+    where: string,
+    scope: 'HKLM' | 'HKCU' | 'defaults',
+  ): DevToolsPolicyState => ({
+    blocked: true,
+    key,
+    value,
+    scope,
+    where,
+    reason:
+      `Chrome's DevTools are disabled by policy (${key}=${value}, set in ${where}). ` +
+      `Chrome refuses debugger attachment while this is set, so browser agents ` +
+      `cannot run. This policy is commonly installed by the eClinicalWorks ` +
+      `plug-in, and it applies to ALL sites, not just the EMR.`,
+  });
 
   try {
     if (process.platform === 'darwin') {
@@ -133,19 +178,19 @@ export async function devToolsDisabledReason(): Promise<string | null> {
       };
       const availability = await read('DeveloperToolsAvailability');
       if (availability === '2') {
-        return disabled('DeveloperToolsAvailability', '2', 'com.google.Chrome preferences');
+        return disabled('DeveloperToolsAvailability', '2', 'com.google.Chrome preferences', 'defaults');
       }
-      if (availability === '1') return null; // explicitly allowed; legacy key is overridden
+      if (availability === '1') return NOT_BLOCKED; // explicitly allowed; legacy key overridden
       if ((await read('DeveloperToolsDisabled')) === '1') {
-        return disabled('DeveloperToolsDisabled', '1', 'com.google.Chrome preferences');
+        return disabled('DeveloperToolsDisabled', '1', 'com.google.Chrome preferences', 'defaults');
       }
-      return null;
+      return NOT_BLOCKED;
     }
 
     if (process.platform === 'win32') {
       // Machine policy first, then per-user. reg.exe exits non-zero when the
       // value is absent, which is the normal case.
-      for (const root of ['HKLM', 'HKCU']) {
+      for (const root of ['HKLM', 'HKCU'] as const) {
         const path = `${root}\\SOFTWARE\\Policies\\Google\\Chrome`;
         const read = async (k: string): Promise<string | null> => {
           try {
@@ -157,19 +202,19 @@ export async function devToolsDisabledReason(): Promise<string | null> {
           }
         };
         const availability = await read('DeveloperToolsAvailability');
-        if (availability === '2') return disabled('DeveloperToolsAvailability', '2', path);
-        if (availability === '1') return null;
+        if (availability === '2') return disabled('DeveloperToolsAvailability', '2', path, root);
+        if (availability === '1') return NOT_BLOCKED;
         if ((await read('DeveloperToolsDisabled')) === '1') {
-          return disabled('DeveloperToolsDisabled', '1', path);
+          return disabled('DeveloperToolsDisabled', '1', path, root);
         }
       }
-      return null;
+      return NOT_BLOCKED;
     }
 
-    return null; // Linux policy lives in JSON under /etc/opt/chrome — not checked yet
+    return NOT_BLOCKED; // Linux policy lives in JSON under /etc/opt/chrome — not checked yet
   } catch {
     // Never let a diagnostic break a run.
-    return null;
+    return NOT_BLOCKED;
   }
 }
 

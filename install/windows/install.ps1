@@ -455,6 +455,53 @@ if ($CurrentUserLower -eq $RunAsUserLower -or $CurrentUserLower.EndsWith("\$RunA
     )
 }
 
+# --- Chrome DevTools policy ------------------------------------------
+#
+# The eClinicalWorks plug-in installer disables DevTools, and Chrome then
+# refuses debugger attachment, so every browser agent on this machine
+# fails with "Cannot read properties of undefined (reading '_page')" --
+# an error that names nothing you can act on. Two customers have hit it;
+# the first cost about two hours to diagnose.
+#
+# ASKED, never assumed. This is a security setting on a machine that may
+# hold patient records, and an installer that quietly relaxes one is not
+# something you want to explain to an auditor. The same tool reverts it
+# (see the uninstall note printed below).
+#
+# Scoped to HKCU where the plug-in put it, so this does not relax Chrome
+# for every account on a shared workstation.
+$PolicyTool = Join-Path $AppDir 'dist\tools\chrome-policy.js'
+if (Test-Path $PolicyTool) {
+    & node $PolicyTool | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        & node $PolicyTool
+        Write-Host ""
+        # A prompt in a session with no console would hang the install
+        # forever. Staff run these by hand today, but "the installer hung
+        # and we don't know why" is not a failure worth risking for a
+        # question we can simply decline to ask.
+        if (-not [Environment]::UserInteractive) {
+            Write-Warn "Not an interactive session -- leaving the policy alone."
+            Write-Warn "Run: node '$PolicyTool' --apply"
+            $reply = 'n'
+        } else {
+            $reply = Read-Host "Allow DevTools so browser agents can run? [y/N]"
+        }
+        if ($reply -match '^[yY]') {
+            & node $PolicyTool --apply
+            if ($LASTEXITCODE -eq 3) {
+                Write-Warn "That needs an elevated prompt -- re-run this installer as Administrator."
+            } else {
+                Write-Warn "Fully quit and reopen Chrome before the first run."
+            }
+        } else {
+            Write-Warn "Left the policy alone. Browser agents will fail on this machine"
+            Write-Warn "until it is changed; re-run the command printed above to fix it."
+        }
+    }
+}
+
 Write-Host ""
 Write-Host "[install] Done."
 Write-Host ""
@@ -463,6 +510,9 @@ Write-Host "  Tail stdout:      Get-Content -Wait -Tail 30 '$(Join-Path $LogsDir
 Write-Host "  Tail stderr:      Get-Content -Wait -Tail 30 '$(Join-Path $LogsDir 'stderr.log')'"
 Write-Host "  Restart:          Stop-ScheduledTask -TaskName $TaskName; Start-ScheduledTask -TaskName $TaskName"
 Write-Host "  Edit config:      notepad '$ConfigFile'  # then restart"
+Write-Host "  Chrome policy:    node '$PolicyTool'           # report"
+Write-Host "                    node '$PolicyTool' --apply   # allow DevTools"
+Write-Host "                    node '$PolicyTool' --revert  # put it back"
 Write-Host ""
 Write-Host "Portal > Staff > Runtimes should show this runtime as **online**"
 Write-Host "within about 15 seconds after '$RunAsUser' logs in. If it stays"

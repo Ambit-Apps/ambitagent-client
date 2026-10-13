@@ -267,6 +267,39 @@ else
   warn "The agent did not appear in launchctl. Check $LOG_DIR/agent.err.log"
 fi
 
+# ── 7. Chrome's DevTools policy ─────────────────────────────────────
+#
+# The eClinicalWorks plug-in installer disables DevTools, and Chrome then
+# refuses debugger attachment — so every browser agent on this machine
+# fails with an error that names nothing useful. Two customers have hit
+# it. Checking here costs a second and turns a two-hour diagnosis into a
+# yes/no question asked while someone is still sitting at the machine.
+#
+# ASKED, never assumed: this is a security setting on a machine that may
+# hold patient records. The installer does not get to quietly relax it.
+# `uninstall.sh` puts it back.
+if [[ -f "$APP_DIR/dist/tools/chrome-policy.js" ]]; then
+  if ! "$NODE_BIN" "$APP_DIR/dist/tools/chrome-policy.js" >/dev/null 2>&1; then
+    echo ""
+    "$NODE_BIN" "$APP_DIR/dist/tools/chrome-policy.js" || true
+    echo ""
+    # Default NO on an empty answer. The safe default for "shall I relax a
+    # security policy?" is to leave it alone.
+    read -r -p "Allow DevTools so browser agents can run? [y/N] " reply </dev/tty || reply=""
+    case "$reply" in
+      [yY]*)
+        "$NODE_BIN" "$APP_DIR/dist/tools/chrome-policy.js" --apply || \
+          warn "Could not change the policy — see the message above."
+        warn "Fully quit and reopen Chrome before the first run."
+        ;;
+      *)
+        warn "Left the policy alone. Browser agents will fail on this machine"
+        warn "until it is changed; re-run the command printed above to fix it."
+        ;;
+    esac
+  fi
+fi
+
 cat <<DONE
 
 Installed.

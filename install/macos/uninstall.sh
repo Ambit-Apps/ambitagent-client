@@ -35,6 +35,20 @@ else
   info "No LaunchAgent installed"
 fi
 
+# Put Chrome's DevTools policy back BEFORE deleting the app — the tool
+# that knows how to revert it lives inside $APP_DIR, and the backup it
+# reads records whether the key was previously absent or merely zero.
+#
+# A vendor that relaxes a security setting and then walks away leaves the
+# machine weaker than it found it, so this is part of uninstalling rather
+# than optional tidying. No backup on record = we never changed it = this
+# prints one line and succeeds.
+if [[ -f "$APP_DIR/dist/tools/chrome-policy.js" ]] && command -v node >/dev/null 2>&1; then
+  info "Restoring Chrome's DevTools policy"
+  node "$APP_DIR/dist/tools/chrome-policy.js" --revert || \
+    echo "  (could not revert automatically — check it by hand)"
+fi
+
 if [[ -d "$APP_DIR" ]]; then
   info "Removing $APP_DIR"
   rm -rf "$APP_DIR"
