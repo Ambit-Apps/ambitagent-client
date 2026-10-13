@@ -30,9 +30,11 @@
  * into install.bat so the daemon knows where to enroll.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -42,20 +44,171 @@ const flag = (name, fallback = null) => {
 };
 const DRY = argv.includes('--dry-run');
 const adminUrl = (flag('admin') ?? process.env.AMBIT_ADMIN_URL ?? '').replace(/\/+$/, '');
-const token = flag('token') ?? process.env.AMBIT_ADMIN_TOKEN ?? '';
 const notes = flag('notes') ?? '';
 
 if (!adminUrl) {
   console.error('--admin <url> is required (or set AMBIT_ADMIN_URL).');
   process.exit(1);
 }
-if (!DRY && !token) {
-  console.error(
-    'A staff JWT is required: --token <jwt>, or AMBIT_ADMIN_TOKEN.\n' +
-      "Sign into the portal and copy `ambit_authToken` from localStorage.",
-  );
-  process.exit(1);
+
+// ── AUTH ─────────────────────────────────────────────────────────────
+//
+// Sessions last 24 hours, and a release goes out every few weeks. So the
+// steady state of the old flow was: build for thirty seconds, fail with
+// HTTP 401, go and find a browser, open devtools, copy a JWT out of
+// localStorage, export it, run the whole thing again.
+//
+// Two things fix that. The token is CACHED, so most publishes need
+// nothing. And when it is missing or stale we log in right here, using
+// the 6-digit code the portal already issues — that code exists to cross
+// from the device holding the email to the device doing the work, which
+// is exactly this.
+//
+// Checked BEFORE the build, deliberately. Finding out you are logged out
+// after doing the work is the wrong order, and it is how this was found.
+
+// ── THE SAME FILE dev-runner USES ──
+//
+// `dev-runner login` in the agents repo already signs a staff user in and
+// saves { api, email, token } to ~/.ambit/config.json at 0600. Standing up
+// a second credential store here would mean the same person logging in
+// twice, on the same machine, for the same account, against the same
+// admin — and two places to look when a token goes stale.
+//
+// So this reads and writes that file, in that shape. The two repos are
+// coupled through it, which is worth knowing: change the shape in one and
+// the other stops seeing your session. It is three keys and they have not
+// moved, so the trade is a good one.
+const CRED_FILE = join(homedir(), '.ambit', 'config.json');
+
+function readCreds() {
+  try {
+    return JSON.parse(readFileSync(CRED_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
 }
+
+function saveCreds(entry) {
+  // Spread what is already there: the file is dev-runner's too, and a key
+  // it adds later must not vanish because we rewrote the file.
+  const next = { ...readCreds(), ...entry };
+  mkdirSync(dirname(CRED_FILE), { recursive: true });
+  writeFileSync(CRED_FILE, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  // writeFileSync's mode only applies when CREATING; an existing file
+  // keeps its own. chmod unconditionally so a file that predates this is
+  // not left world-readable.
+  try { execFileSync('chmod', ['600', CRED_FILE]); } catch { /* Windows differs */ }
+}
+
+/** Authoritative, not a local `exp` check — a token can also be revoked. */
+async function tokenWorks(tok) {
+  if (!tok) return false;
+  try {
+    const r = await fetch(`${adminUrl}/rest/auth/me`, {
+      headers: { authorization: `Bearer ${tok}` },
+    });
+    return r.ok;
+  } catch (err) {
+    console.error(`Could not reach ${adminUrl}: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+async function logIn() {
+  if (!process.stdin.isTTY) {
+    console.error(
+      'Not signed in, and there is no terminal to ask on.\n' +
+        'Set AMBIT_ADMIN_TOKEN, or run this from an interactive shell.',
+    );
+    process.exit(1);
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const remembered = readCreds().email ?? '';
+    const prompt = remembered ? `Email [${remembered}]: ` : 'Email: ';
+    const email = (await rl.question(prompt)).trim() || remembered;
+    if (!email) {
+      console.error('An email address is required.');
+      process.exit(1);
+    }
+
+    const req = await fetch(`${adminUrl}/rest/auth/request-link`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    if (!req.ok) {
+      console.error(`Could not send a login code: HTTP ${req.status}\n${await req.text()}`);
+      process.exit(1);
+    }
+    // The response is deliberately the same whether or not the address is
+    // a real user, so this cannot say "check your email, if you exist".
+    console.log(`\nA 6-digit code is on its way to ${email}. It is good for 15 minutes.`);
+
+    const code = (await rl.question('Code: ')).replace(/\D/g, '');
+    const res = await fetch(`${adminUrl}/rest/auth/verify-code`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, code }),
+    });
+    if (!res.ok) {
+      console.error(`\nSign-in failed: HTTP ${res.status}\n${await res.text()}`);
+      process.exit(1);
+    }
+    const body = await res.json();
+    if (!body?.token) {
+      console.error('\nSign-in returned no token — nothing to publish with.');
+      process.exit(1);
+    }
+    // `api` goes in alongside the token because the two belong together —
+    // a token is only valid against the admin that issued it. This is the
+    // same "last login wins" contract dev-runner already documents, so a
+    // publish to production does retarget dev-runner's default. Pass
+    // --api to it, or log in again, to point somewhere else.
+    saveCreds({ api: adminUrl, email, token: body.token });
+    const hours = Math.round((body.expires_in ?? 86400) / 3600);
+    console.log(`Signed in. Saved to ${CRED_FILE} — good for about ${hours}h.\n`);
+    return body.token;
+  } finally {
+    rl.close();
+  }
+}
+
+/** --token and the env var still win, for CI and one-off overrides. */
+async function resolveToken() {
+  // CHECKED, not trusted. An explicit token used to short-circuit straight
+  // past the validity check, which meant the whole "find out before you
+  // build" promise did not apply to the one case that actually broke: a
+  // stale AMBIT_ADMIN_TOKEN exported into a shell weeks ago. Sessions last
+  // 24 hours, so an exported one is wrong far more often than it is right,
+  // and it silently outranked a perfectly good saved session.
+  const fromFlag = flag('token');
+  const explicit = fromFlag ?? process.env.AMBIT_ADMIN_TOKEN ?? '';
+  if (explicit) {
+    if (await tokenWorks(explicit)) return explicit;
+    const source = fromFlag ? '--token' : 'AMBIT_ADMIN_TOKEN';
+    const hint = fromFlag
+      ? 'Drop --token to stop seeing this.'
+      : 'Run `unset AMBIT_ADMIN_TOKEN` to stop seeing this.';
+    console.log(
+      `${source} was supplied but the admin rejected it — it has probably ` +
+        `expired (sessions last 24h).\nIgnoring it and using your saved ` +
+        `session instead. ${hint}\n`,
+    );
+  }
+  // No check that the saved `api` matches --admin: tokenWorks() asks the
+  // admin we are actually publishing to, which settles it. A staging token
+  // simply fails against production and we log in, rather than us guessing
+  // from two URL strings whether they are the same host.
+  const cached = readCreds().token ?? '';
+  if (await tokenWorks(cached)) return cached;
+  if (cached) console.log('Your saved session has expired.\n');
+  return logIn();
+}
+
+let token = '';
+if (!DRY) token = await resolveToken();
 
 // 1. Build. The script refuses to run with uncommitted changes, which is
 //    what makes the SHA in the version string trustworthy — so this
@@ -119,15 +272,30 @@ if (DRY) {
 }
 
 // 3. Upload.
-const res = await fetch(`${adminUrl}/rest/client-releases`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-  body: JSON.stringify({
-    version,
-    notes: notes || null,
-    files: files.map(({ path, contents_b64, platform }) => ({ path, contents_b64, platform })),
-  }),
+const body = JSON.stringify({
+  version,
+  notes: notes || null,
+  files: files.map(({ path, contents_b64, platform }) => ({ path, contents_b64, platform })),
 });
+const post = (tok) =>
+  fetch(`${adminUrl}/rest/client-releases`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${tok}` },
+    body,
+  });
+
+let res = await post(token);
+
+// A token checked before the build can still lapse during it — the window
+// is small but it is real, and the cost of being wrong is making someone
+// sign in and rebuild. One retry, only on 401, and only when we were not
+// handed a token explicitly: if a caller passed --token we have no mandate
+// to go and get a different one.
+if (res.status === 401) {
+  console.log('\nThe session lapsed while building. Signing in again…\n');
+  token = await logIn();
+  res = await post(token);
+}
 
 if (res.status === 409) {
   console.error(
