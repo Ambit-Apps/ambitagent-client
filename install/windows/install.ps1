@@ -29,7 +29,7 @@
 #        - Enrollment token: <copied from email body>
 #        - Run-as user:      <defaults to the current logged-in user;
 #                            usually just press Enter>
-#   4. Wait ~5 min (Node install + npm ci + Chromium download).
+#   4. Wait a couple of minutes (Node install if absent, then npm ci).
 #   5. Log OFF and back ON to trigger the "at logon" task (or just wait
 #      until tomorrow morning). Runtime appears online in portal /staff/runtimes.
 #
@@ -306,10 +306,28 @@ try {
     & npm run build
     if ($LASTEXITCODE -ne 0) { Write-Fail 'npm run build failed.' }
 
-    Write-Info "Downloading Playwright Chromium into $BrowsersDir..."
-    $env:PLAYWRIGHT_BROWSERS_PATH = $BrowsersDir
-    & npx playwright install chromium
-    if ($LASTEXITCODE -ne 0) { Write-Fail 'playwright install chromium failed.' }
+    # ── NO CHROMIUM DOWNLOAD ──
+    #
+    # This used to run `npx playwright install chromium` -- 362 MB on disk,
+    # and the single largest thing any install pulled down. On a slow site
+    # with three machines it dominated the visit.
+    #
+    # It was never used. Every agent that runs in production declares
+    # browser.model = 'attached_chrome' and drives the customer's REAL
+    # Chrome over CDP; agents that declare no model still attach, because
+    # launchBrowser computes shouldAttach from the attachCdpUrl the daemon
+    # hands it, and the daemon manages Chrome itself by default. Bundled
+    # Chromium is reachable only with daemon-managed Chrome switched off,
+    # which nothing does.
+    #
+    # The macOS installer has never downloaded it and has never needed to.
+    # The two platforms disagreeing was the tell.
+    #
+    # If some future agent genuinely wants Chromium, the run fails with
+    # BINARY_HINT in browser.ts -- "Playwright Chromium binary is missing on
+    # this runtime. Install it with: npx playwright install chromium" --
+    # which is the exact command, and PLAYWRIGHT_BROWSERS_PATH still goes
+    # into the config below, so it lands where the daemon looks for it.
 } finally {
     Pop-Location
 }
