@@ -128,6 +128,34 @@ if [[ -f "$CONFIG_FILE" ]]; then
     EXISTING_KEYS+=("$key"); EXISTING_VALS+=("$val")
   done < "$CONFIG_FILE"
   info "Existing config found — values will be preserved"
+  # Name the enrollment token specifically, and say how to override it.
+  #
+  # Reuse is the right default: a reinstall is almost always a repair or
+  # an upgrade of the SAME machine, and making someone find a token to fix
+  # a broken install would be cruel. But it is also the one preserved
+  # value that decides WHICH RUNTIME this machine is, and "values will be
+  # preserved" does not tell you that.
+  #
+  # The case that stings is re-pointing a machine at a different runtime
+  # or tenant: the installer silently reuses the old token, says "Agent is
+  # running", and the daemon then loops on 4401 because that token belongs
+  # to a runtime that was deleted or lives in another tenant. The override
+  # has always existed -- env beats config -- but it appeared nowhere on
+  # screen, so the only visible way out was editing a file by hand.
+  # INDEX expansion, not value expansion. macOS ships bash 3.2.57, where
+  # "${ARR[@]}" on an EMPTY array is an unbound variable under `set -u` and
+  # aborts the script -- reachable here with a config file that exists but
+  # holds only comments. "${!ARR[@]}" is empty-safe, and is what
+  # existing_value() below already uses for the same reason.
+  for _i in "${!EXISTING_KEYS[@]}"; do
+    _k="${EXISTING_KEYS[$_i]}"
+    if [[ "$_k" == "ENROLLMENT_TOKEN" ]]; then
+      info "  Reusing the enrollment token already on this machine."
+      info "  To point it at a DIFFERENT runtime, re-run as:"
+      info "    AMBIT_ENROLLMENT_TOKEN=<new token> bash ./install.sh"
+      break
+    fi
+  done
 fi
 
 existing_value() {

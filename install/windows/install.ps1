@@ -116,6 +116,19 @@ if ($ExistingConfig.Count -gt 0) {
     # Windows-1252, so a UTF-8 em dash here reaches the customer's console as
     # mojibake. Comments can hold whatever they like; output cannot.
     Write-Info "Found an existing config with $($ExistingConfig.Count) setting(s) - these will be carried forward."
+    # Call out the enrollment token by name, and say how to override it.
+    # Reuse is the right default -- a reinstall is nearly always repairing
+    # or upgrading the SAME machine -- but it is the one carried-forward
+    # value that decides WHICH RUNTIME this machine is, and "carried
+    # forward" does not say that. Re-pointing a machine at a different
+    # runtime otherwise ends in a silent 4401 loop behind an installer
+    # that reported success. The env override has always worked; it just
+    # appeared nowhere on screen.
+    if ($ExistingConfig.ContainsKey('ENROLLMENT_TOKEN')) {
+        Write-Info "  Reusing the enrollment token already on this machine."
+        Write-Info "  To point it at a DIFFERENT runtime, set AMBIT_ENROLLMENT_TOKEN"
+        Write-Info "  to the new token before running install.bat."
+    }
 }
 
 # Keys this installer owns and rewrites. Everything else in the file was
