@@ -155,6 +155,16 @@ export interface RunTaskMessage {
    * — the runtime falls back to its env-var-driven behavior in that case.
    */
   browser?: BrowserSpec;
+  /**
+   * Whether this agent wants a browser — the manifest's own `runtime_type`,
+   * passed through by the admin rather than inferred here.
+   *
+   * OPTIONAL, and `bundleUsesPlaywright` keeps its fallback for when it is
+   * absent: during a rollout this runtime can be NEWER than the admin it is
+   * talking to, and an old admin does not send this field. Absent means
+   * "decide for yourself", never "api".
+   */
+  runtime_type?: 'api' | 'browser';
 }
 
 export interface RunTaskFile {

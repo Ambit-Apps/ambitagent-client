@@ -2,7 +2,7 @@
   "name": "ambitagent-client",
   "version": "0.0.1",
   "private": true,
-  "description": "Ambit Agent Platform — local runtime daemon. Connects to the admin control plane over an outbound WebSocket, receives task-run instructions, executes them (Playwright when needed), streams events back.",
+  "description": "Ambit Agent Platform \u2014 local runtime daemon. Connects to the admin control plane over an outbound WebSocket, receives task-run instructions, executes them (Playwright when needed), streams events back.",
   "type": "module",
   "bin": {
     "ambit-agent": "./dist/main.js"
@@ -11,7 +11,8 @@
     "dev": "tsx watch --ignore \"**/ambit-run-*/**\" src/main.ts",
     "build": "tsc",
     "start": "node dist/main.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "find src -name '*.test.ts' -exec tsx --test {} +"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
