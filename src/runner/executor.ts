@@ -11,6 +11,7 @@ import type {
 } from '../protocol/ws.js';
 import type { Logger } from '../log.js';
 import { launchBrowser } from './browser.js';
+import { buildAdminCapabilities } from './capabilities.js';
 
 /**
  * Real executor — mirrors `apps/api/src/worker.ts` on the admin side,
@@ -273,7 +274,11 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
         }
 
         // 6) Build ctx + execute.
-        const ctx = createRuntimeCtx({
+        // Awaited now: the ctx asks the admin which of the proxied
+        // capabilities it serves before handing itself to the script. See
+        // createRuntimeCtx and capabilities.ts for why that question cannot
+        // be deferred to first use.
+        const ctx = await createRuntimeCtx({
           runState,
           runId: msg.runId,
           inputs: msg.inputs,
@@ -429,7 +434,7 @@ export function createRealExecutor(log: Logger, config: ExecutorConfig): Executo
  * — the whole point of the parity is that the same code works on
  * either side.
  */
-function createRuntimeCtx({
+async function createRuntimeCtx({
   runState,
   runId,
   inputs,
@@ -502,9 +507,33 @@ function createRuntimeCtx({
     return `artifact:${name}`;
   };
 
+  // ── CAPABILITIES THE ADMIN IMPLEMENTS ──
+  // ctx.data, ctx.sheets, ctx.docs and ctx.drive, proxied for the same
+  // reason ctx.ai.complete is: the credential is the platform's and stays on
+  // the admin. Asked for ONCE here, before the script runs, because an
+  // absent capability must be an UNDEFINED member — every agent guards with
+  // `ctx.data?.` and no agent can guard against a member that throws.
+  //
+  // Never fails a run. An admin that is older, unconfigured or simply not
+  // answering yields no members and a line on the run's event stream saying
+  // which and why.
+  const adminCapabilities = await buildAdminCapabilities({
+    config,
+    runId,
+    emit,
+    log,
+    signal,
+  });
+
   return {
     inputs: inputs ?? {},
     dryRun: false,
+
+    // Spread FIRST so nothing below can shadow one by accident, and so an
+    // absent capability stays absent rather than becoming an own-property
+    // set to undefined — `'data' in ctx` should be false, not true-with-
+    // undefined, for anyone who checks that way.
+    ...adminCapabilities,
 
     credentials(id: string) {
       const bundle = credentials[id];
@@ -1010,6 +1039,22 @@ async function tryReadSubdirs(dir: string): Promise<string[]> {
  * so the runtime doesn't have to guess.
  */
 async function bundleUsesPlaywright(msg: RunTaskMessage): Promise<boolean> {
+  // The admin's own answer, when it sent one. It reads `runtime_type`
+  // straight off the task definition, so there is nothing to infer.
+  if (msg.runtime_type === 'browser') return true;
+  if (msg.runtime_type === 'api') return false;
+
+  // ── THE FALLBACK, AND WHY IT IS STILL HERE ──
+  // An OLD admin does not send `runtime_type`, and during a rollout this
+  // runtime may be the newer half. So the guess stays — but it is now only
+  // reached when nobody told us, instead of being the only answer.
+  //
+  // It is a poor guess, which is why the field above exists. It matches a
+  // file that merely MENTIONS `ctx.page` — a doc comment, a type, a message
+  // explaining a guard — and launches Chrome for an agent that wants none;
+  // that is how this was found, by a comment describing the grep tripping
+  // the grep. And it misses an agent that reaches the page through a shared
+  // `@ambit/lib-*` helper, because only the entry file is searched.
   const main = msg.files.find((f) => f.path === 'src/main.ts');
   if (!main) return false;
   return /ctx\.page|ctx\.uploadScreenshot/.test(main.contents);

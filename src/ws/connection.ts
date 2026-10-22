@@ -8,6 +8,7 @@ import type {
 } from '../protocol/ws.js';
 import type { Config } from '../config.js';
 import type { Logger } from '../log.js';
+import { summarizeFrame } from './redact.js';
 
 /**
  * Outbound-only WebSocket connection to the admin control plane.
@@ -137,7 +138,12 @@ export function createConnection(config: Config, log: Logger): Connection {
       const text = typeof raw === 'string' ? raw : raw.toString('utf8');
       const msg = parseAdminMessage(text);
       if (!msg) {
-        log.warn({ text }, 'unparseable admin message');
+        // NEVER the raw frame. A run_task carries the customer's decrypted
+        // credentials, so logging `text` put their eCW password in a plain
+        // file on their machine the first time a frame arrived truncated.
+        // summarizeFrame keeps what a protocol mismatch is diagnosed from —
+        // length, claimed type, key NAMES — and masks the rest.
+        log.warn(summarizeFrame(text), 'unparseable admin message');
         return;
       }
       log.info({ type: msg.type }, 'admin message');
