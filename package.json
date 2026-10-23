@@ -12,7 +12,8 @@
     "build": "tsc",
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "find src -name '*.test.ts' -exec tsx --test {} +"
+    "test": "find src -name '*.test.ts' -exec tsx --test {} +",
+    "reset-site": "node scripts/reset-site.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
