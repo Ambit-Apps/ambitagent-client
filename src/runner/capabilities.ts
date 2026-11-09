@@ -58,6 +58,8 @@ export interface DriveApi {
     name: string;
     bytes: Uint8Array;
     mimeType?: string;
+    /** A sub-folder of `folder` to file into, made if missing. Ignored by an older admin. */
+    subfolder?: string;
   }): Promise<unknown>;
 }
 
@@ -304,10 +306,12 @@ export async function buildAdminCapabilities(opts: {
     };
 
     members.drive = {
-      async upload({ folder, name, bytes, mimeType }) {
+      async upload({ folder, name, bytes, mimeType, subfolder }) {
         // Base64, because the proxy speaks JSON like every other ctx call.
         // The admin enforces the 5 MB cap with a message that names it, so
         // an oversized file is refused in words rather than at the socket.
+        // `subfolder` is optional: an admin older than it ignores the field
+        // and files into `folder`, which is the documented fallback.
         return cloudCall(
           '/rest/cloud/drive/upload',
           {
@@ -315,6 +319,7 @@ export async function buildAdminCapabilities(opts: {
             name,
             bytesB64: Buffer.from(bytes).toString('base64'),
             mimeType,
+            ...(subfolder ? { subfolder } : {}),
           },
           'ctx.drive.upload',
         );
