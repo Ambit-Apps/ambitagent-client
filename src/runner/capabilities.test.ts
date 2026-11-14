@@ -213,3 +213,45 @@ test('an HTML error page from a proxy is bounded, not pasted whole', async () =>
   const msg = await describeFailure(res, 'ctx.data.get');
   assert.ok(msg.length < 400, 'a log line is not a web page');
 });
+
+// ── ctx.drive.list / download: present only when the admin lists them ──
+
+test('an admin that does not LIST drive/list and drive/download leaves both undefined', async () => {
+  // Today's production admin: upload works, the folder reads do not exist.
+  // Defining them anyway would 404 mid-run; absent lets the agent's guard
+  // say "this machine cannot read the folder yet".
+  const { members } = await build({
+    '/rest/data/capability': () => json({}),
+    '/rest/cloud/capability': () =>
+      json({ configured: true, principal: 'sa@x.iam.gserviceaccount.com', methods: ['drive/upload'] }),
+  });
+  assert.ok(members.drive?.upload);
+  assert.equal(members.drive?.list, undefined);
+  assert.equal(members.drive?.download, undefined);
+});
+
+test('download decodes the admin’s base64 into the bytes the agent gets', async () => {
+  const { members } = await build({
+    '/rest/data/capability': () => json({}),
+    '/rest/cloud/capability': () =>
+      json({ configured: true, principal: 'sa@x.iam.gserviceaccount.com', methods: ['drive/upload', 'drive/list', 'drive/download'] }),
+  });
+  let sent: Record<string, unknown> = {};
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    sent = { url: String(input), ...JSON.parse(String(init?.body)) };
+    return json({ id: 'f1', name: 'DA Rank Wk45 2026.xlsm', mimeType: 'x', bytes: 3, bytesB64: Buffer.from([1, 2, 3]).toString('base64') });
+  }) as typeof fetch;
+  let r: { bytes: Uint8Array; name: string; bytesB64?: string };
+  try {
+    r = (await members.drive!.download!({ file: 'f1' })) as typeof r;
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.match(String(sent.url), /\/rest\/cloud\/drive\/download$/);
+  assert.equal(sent.runId, '7');
+  assert.equal(sent.file, 'f1');
+  assert.deepEqual([...r.bytes], [1, 2, 3]);
+  assert.equal(r.name, 'DA Rank Wk45 2026.xlsm');
+  assert.equal(r.bytesB64, undefined, 'the base64 is not handed on as well');
+});

@@ -61,6 +61,10 @@ export interface DriveApi {
     /** A sub-folder of `folder` to file into, made if missing. Ignored by an older admin. */
     subfolder?: string;
   }): Promise<unknown>;
+  /** Everything in a folder a customer shared. Only when the admin lists `drive/list`. */
+  list?(opts: { folder: string }): Promise<unknown>;
+  /** One file's bytes (`bytes: Uint8Array`). Only when the admin lists `drive/download`. */
+  download?(opts: { file: string }): Promise<unknown>;
 }
 
 export interface DataApi {
@@ -325,6 +329,27 @@ export async function buildAdminCapabilities(opts: {
         );
       },
     };
+
+    // Reading a customer's folder (the admin's cloud-files/intake.ts).
+    // Defined only when the admin LISTS the method: rule 3 of *Never break
+    // an installed client* run the other way — this client talking to an
+    // admin that has not deployed them must leave them undefined, so the
+    // agent's guard reports it instead of the first call 404ing mid-run.
+    const methods = Array.isArray(cloudProbe.info.methods) ? (cloudProbe.info.methods as unknown[]) : [];
+    if (methods.includes('drive/list')) {
+      members.drive.list = ({ folder }) => cloudCall('/rest/cloud/drive/list', { folder }, 'ctx.drive.list');
+    }
+    if (methods.includes('drive/download')) {
+      members.drive.download = async ({ file }) => {
+        // Base64 on the wire, a Uint8Array to the agent — the mirror of upload.
+        const r = (await cloudCall('/rest/cloud/drive/download', { file }, 'ctx.drive.download')) as {
+          bytesB64: string;
+          [k: string]: unknown;
+        };
+        const { bytesB64, ...rest } = r;
+        return { ...rest, bytes: new Uint8Array(Buffer.from(bytesB64, 'base64')) };
+      };
+    }
   }
 
   return members;
