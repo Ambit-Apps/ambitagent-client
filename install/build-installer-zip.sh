@@ -129,11 +129,31 @@ for p in "${INCLUDES[@]}"; do
     echo "  $p"
 done
 
-zip_args=(-rq "$OUT_PATH" "${INCLUDES[@]}")
-for e in "${EXCLUDES[@]}"; do
-    zip_args+=(-x "$e")
-done
-zip "${zip_args[@]}"
+if command -v zip >/dev/null 2>&1; then
+    zip_args=(-rq "$OUT_PATH" "${INCLUDES[@]}")
+    for e in "${EXCLUDES[@]}"; do
+        zip_args+=(-x "$e")
+    done
+    zip "${zip_args[@]}"
+elif [ -x /c/Windows/System32/tar.exe ]; then
+    # Windows without Info-ZIP (Git Bash ships none). Windows' own bsdtar
+    # writes a .zip with -a. Git's /usr/bin/tar is GNU tar and cannot.
+    tar_args=(-a -c -f "$(cygpath -w "$OUT_PATH")")
+    for e in "${EXCLUDES[@]}"; do
+        tar_args+=(--exclude "$e")
+    done
+    /c/Windows/System32/tar.exe "${tar_args[@]}" "${INCLUDES[@]}"
+else
+    echo "ERROR: no zip tool — install zip, or run this on macOS/Linux" >&2
+    exit 1
+fi
+
+# Whatever built it, a release must never carry secrets or dependencies.
+if /c/Windows/System32/tar.exe -t -f "$(cygpath -w "$OUT_PATH" 2>/dev/null || echo "$OUT_PATH")" 2>/dev/null       | grep -E '(^|/)(\.env($|\.)|node_modules/)' | grep -v '\.env\.example$' >/dev/null; then
+    echo "ERROR: $OUT_PATH contains a .env or node_modules — refusing" >&2
+    rm -f "$OUT_PATH"
+    exit 1
+fi
 
 SIZE=$(du -h "$OUT_PATH" | awk '{print $1}')
 echo ""
