@@ -215,7 +215,16 @@ if (!DRY) token = await resolveToken();
 //    deliberately does NOT pass --dirty. A release you cannot point at a
 //    commit is not a release.
 console.log('Building the installer zip…');
-execFileSync(join(ROOT, 'install/build-installer-zip.sh'), { cwd: ROOT, stdio: 'inherit' });
+// Windows cannot exec a .sh directly (spawnSync EFTYPE), so it goes through
+// Git Bash — named explicitly, because a bare `bash` on Windows can resolve
+// to WSL's, which sees a different filesystem. AMBIT_BASH overrides it.
+const buildScript = join(ROOT, 'install/build-installer-zip.sh');
+if (process.platform === 'win32') {
+  const bash = process.env.AMBIT_BASH ?? 'C:/Program Files/Git/bin/bash.exe';
+  execFileSync(bash, [buildScript.split('\\').join('/')], { cwd: ROOT, stdio: 'inherit' });
+} else {
+  execFileSync(buildScript, { cwd: ROOT, stdio: 'inherit' });
+}
 
 // 2. Find what it just built: newest zip in install/dist.
 const distDir = join(ROOT, 'install/dist');
