@@ -74,11 +74,29 @@ export interface DataApi {
   delete(opts: { namespace: string; key: string }): Promise<boolean>;
 }
 
+/**
+ * Texts and emails, sent by the admin (its capabilities/notify). The address
+ * goes up; what comes back names the person only by a hint ("•••0142").
+ * The admin decides whether to send — test mode, sign-up for texts, once per
+ * run, a cap — so nothing here can switch those off.
+ */
+export interface NotifyApi {
+  send(msg: { channel: 'email' | 'text'; to: string; subject?: string; body: string; tag: string }): Promise<{
+    sent: boolean;
+    id?: string;
+    error?: string;
+    status?: string;
+    duplicate?: boolean;
+    to?: string;
+  }>;
+}
+
 export interface AdminCapabilities {
   data?: DataApi;
   sheets?: SheetsApi;
   docs?: DocsApi;
   drive?: DriveApi;
+  notify?: NotifyApi;
 }
 
 /**
@@ -187,10 +205,12 @@ export async function buildAdminCapabilities(opts: {
 
   let dataProbe: Awaited<ReturnType<typeof probe>>;
   let cloudProbe: Awaited<ReturnType<typeof probe>>;
+  let notifyProbe: Awaited<ReturnType<typeof probe>>;
   try {
-    [dataProbe, cloudProbe] = await Promise.all([
+    [dataProbe, cloudProbe, notifyProbe] = await Promise.all([
       probe(config, '/rest/data/capability', timer.signal),
       probe(config, '/rest/cloud/capability', timer.signal),
+      probe(config, '/rest/notify/capability', timer.signal),
     ]);
   } finally {
     clearTimeout(timeout);
@@ -350,6 +370,23 @@ export async function buildAdminCapabilities(opts: {
         return { ...rest, bytes: new Uint8Array(Buffer.from(bytesB64, 'base64')) };
       };
     }
+  }
+
+  // ── ctx.notify ──
+  // Absence is NOT announced, unlike the others: most agents never send a
+  // message, and an admin without a notify key is the normal state until a
+  // customer's texting is approved — a line on every run's stream would be
+  // noise. The agents that send already report "not sent" in their own words.
+  if (notifyProbe.ok && notifyProbe.info.configured === true) {
+    members.notify = {
+      send: async (msg) => {
+        // A refusal (test mode, not signed up) is a 200 with sent:false — it
+        // is an answer, not an error. Only a broken call throws here, and the
+        // agent records it as not sent.
+        const r = (await call('/rest/notify/send', msg, 'ctx.notify.send')) as Awaited<ReturnType<NotifyApi['send']>>;
+        return r;
+      },
+    };
   }
 
   return members;

@@ -255,3 +255,40 @@ test('download decodes the admin’s base64 into the bytes the agent gets', asyn
   assert.equal(r.name, 'DA Rank Wk45 2026.xlsm');
   assert.equal(r.bytesB64, undefined, 'the base64 is not handed on as well');
 });
+
+// ── ctx.notify ───────────────────────────────────────────────────────────
+
+test('ctx.notify exists only when the admin says it is configured, and its absence is quiet', async () => {
+  const base = {
+    '/rest/data/capability': () => json({ capability: 'agent-data' }),
+    '/rest/cloud/capability': () => json({ capability: 'cloud-files', configured: true, principal: 'p@x', methods: [] }),
+  };
+  const old = await build({ ...base, '/rest/notify/capability': () => new Response('Not Found', { status: 404 }) });
+  assert.ok(!('notify' in old.members));
+  assert.equal(old.rec.messages.length, 0, 'an admin without notify adds nothing to the run stream');
+
+  const off = await build({ ...base, '/rest/notify/capability': () => json({ capability: 'notify', configured: false, channels: [] }) });
+  assert.ok(!('notify' in off.members));
+
+  const on = await build({ ...base, '/rest/notify/capability': () => json({ capability: 'notify', configured: true, channels: ['email'] }) });
+  assert.equal(typeof on.members.notify?.send, 'function');
+});
+
+test('ctx.notify.send posts the message with the runId and returns the admin answer as is', async () => {
+  let posted: Record<string, unknown> = {};
+  const restore = stubFetch({
+    '/rest/data/capability': () => json({}),
+    '/rest/cloud/capability': () => json({ configured: false }),
+    '/rest/notify/capability': () => json({ configured: true, channels: ['text'] }),
+  });
+  const members = await buildAdminCapabilities({ config: CONFIG, runId: '7', emit: () => {}, log: SILENT }).finally(restore);
+  const restore2 = stubFetch({});
+  globalThis.fetch = (async (_u: string, init: RequestInit) => {
+    posted = JSON.parse(String(init.body));
+    return json({ sent: false, status: 'refused', error: 'test mode', to: '•••0142' });
+  }) as typeof fetch;
+  const r = await members.notify!.send({ channel: 'text', to: '7025550142', body: 'hi', tag: 'route' }).finally(restore2);
+  assert.equal(posted.runId, '7');
+  assert.equal(posted.channel, 'text');
+  assert.deepEqual(r, { sent: false, status: 'refused', error: 'test mode', to: '•••0142' });
+});
